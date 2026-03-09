@@ -79,10 +79,11 @@ async def cmd_collect(resume: bool = False):
 
 async def cmd_status():
     from manifest import init_manifest, get_manifest_summary, get_progress_counts
-    from registry import get_stats
+    from registry import init_registry, get_stats
 
     os.makedirs("db", exist_ok=True)
     await init_manifest()
+    await init_registry()
 
     rows  = await get_manifest_summary()
     stats = await get_progress_counts()
