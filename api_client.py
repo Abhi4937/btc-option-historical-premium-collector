@@ -163,21 +163,33 @@ class DeltaAPIClient:
         resolution: str = "1m",
     ) -> list[dict]:
         """
-        Fetch candles with automatic pagination.
+        Fetch candles with time-based chunked pagination.
 
-        Test 4 verified: boundary candle appears in BOTH chunk1 (end=T) and
-        chunk2 (start=T). Use start = prev_end + 1 for next chunk.
-        Deduplicate by 'time' field at the end as a safety net.
+        ROOT CAUSE discovered in test-run: for large time ranges the API returns
+        only the 2000 MOST RECENT candles, not the 2000 oldest. The original
+        `chunk_start = last_ts + 1` strategy advanced near the end of the
+        range and terminated early, leaving most of the history unfetched.
+
+        FIX: divide the total range into fixed 2000-minute time windows from
+        the start. Each window is ≤ 2000 minutes, so the API returns ALL
+        candles in that window in one call (verified by Test 4).
+
+        Test 4 rule preserved: next window start = prev window end + 1s to
+        avoid duplicate boundary candle. Deduplicate by 'time' as safety net.
         """
+        # 2000-minute window = 120,000 seconds (matches API's 2000-candle limit)
+        CHUNK_SECONDS = MAX_CANDLES_PER_CALL * 60  # 120,000 s
+
         all_candles: list[dict] = []
         chunk_start = start_unix
 
         while chunk_start <= end_unix:
+            chunk_end = min(chunk_start + CHUNK_SECONDS, end_unix)
             params = {
                 "symbol":     symbol,
                 "resolution": resolution,
                 "start":      chunk_start,
-                "end":        end_unix,
+                "end":        chunk_end,
             }
             data = await self._get("/v2/history/candles", params)
             if data is None:
@@ -185,20 +197,19 @@ class DeltaAPIClient:
 
             candles = data.get("result") or []
             if not candles:
-                break
+                # Empty window — still advance (gap in data)
+                if chunk_end >= end_unix:
+                    break
+                chunk_start = chunk_end + 1
+                continue
 
             all_candles.extend(candles)
 
-            if len(candles) < MAX_CANDLES_PER_CALL:
-                # Got fewer than max → no more pages
+            if chunk_end >= end_unix:
                 break
 
-            # Advance: next chunk starts 1 second after last candle's close time
-            # (Test 4: start=T+1s avoids duplicate of boundary candle)
-            last_ts = max(c["time"] for c in candles)
-            if last_ts >= end_unix:
-                break
-            chunk_start = last_ts + 1
+            # Test 4: +1s avoids duplicate of the boundary candle
+            chunk_start = chunk_end + 1
 
         # Deduplicate by timestamp (Test 4: safety net)
         seen: set[int] = set()

@@ -266,6 +266,215 @@ async def cmd_test_depth():
         console.print("\n[red]  Could not determine start date — check API access[/red]")
 
 
+async def cmd_test_run(month_key: str | None = None):
+    """
+    Single-account test run for one expiry month.
+    Collects data, then verifies parquet files look correct.
+    Step 3 from build instructions.
+    """
+    import pyarrow.parquet as pq
+    import glob as _glob
+
+    from manifest import init_manifest, populate_manifest
+    from registry import init_registry
+    from worker import AccountWorker
+    from config import OPTIONS_DIR, SPOT_PARQUET
+
+    load_dotenv()
+    key  = os.getenv("ACCOUNT_1_KEY")
+    name = os.getenv("ACCOUNT_1_NAME", "lava")
+    if not key:
+        console.print("[red]ACCOUNT_1_KEY not found in .env[/red]")
+        return
+
+    # Default: use the most recent complete month (last month)
+    if not month_key:
+        today   = datetime.now(IST)
+        # go back one month to get a complete month
+        if today.month == 1:
+            month_key = f"{today.year - 1}-12"
+        else:
+            month_key = f"{today.year}-{today.month - 1:02d}"
+
+    console.print(f"\n[bold cyan]═══ SINGLE-ACCOUNT TEST RUN ═══[/bold cyan]")
+    console.print(f"  Account  : [yellow]{name}[/yellow]")
+    console.print(f"  Month    : [yellow]{month_key}[/yellow]")
+    console.print(f"  Mode     : ACTIVE_ACCOUNTS=1\n")
+
+    os.makedirs("db",   exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+
+    # Init DBs fresh for this test (or reuse if already initialised)
+    await init_manifest()
+    await init_registry()
+
+    # Populate manifest with ONLY this one month
+    year  = int(month_key[:4])
+    month = int(month_key[5:7])
+    await populate_manifest(year, month, year, month)
+
+    console.print(f"[cyan]Manifest seeded with 1 month: {month_key}[/cyan]")
+    console.print("[cyan]Starting worker (lava)...[/cyan]\n")
+
+    status_log: list[dict] = []
+
+    def status_cb(account_name, state):
+        status_log.append({**state, "account": account_name})
+        sym   = state.get("symbol", "")
+        calls = state.get("calls",  0)
+        st    = state.get("state",  "")
+        if sym:
+            console.print(f"  [{account_name}] {st:18s} calls={calls:5d}  {sym}")
+
+    worker = AccountWorker(
+        account_name    = name,
+        api_key         = key,
+        status_callback = status_cb,
+    )
+
+    t0 = time.monotonic()
+    await worker.run()
+    elapsed = time.monotonic() - t0
+
+    console.print(f"\n[bold green]Worker finished in {elapsed:.1f}s[/bold green]\n")
+
+    # ── PARQUET VERIFICATION ─────────────────────────────────────────────────
+    console.print("[bold cyan]═══ PARQUET VERIFICATION ═══[/bold cyan]\n")
+
+    errors   = 0
+    verified = 0
+
+    # 1. Spot file
+    if os.path.exists(SPOT_PARQUET):
+        t = pq.read_table(SPOT_PARQUET)
+        console.print(f"[green]✅ Spot parquet exists[/green]")
+        console.print(f"   Rows    : {len(t):,}")
+        console.print(f"   Columns : {t.schema.names}")
+        # Check required columns
+        required_spot = {"timestamp_ist","timestamp_unix","mark_open","mark_close","ltp_volume","oi_close"}
+        missing = required_spot - set(t.schema.names)
+        if missing:
+            console.print(f"   [red]⚠ Missing columns: {missing}[/red]")
+            errors += 1
+        else:
+            console.print(f"   [green]All required columns present ✅[/green]")
+        # Show first and last row timestamps
+        if len(t) > 0:
+            ts_list = t.column("timestamp_unix").to_pylist()
+            first_ist = datetime.fromtimestamp(ts_list[0],  tz=IST).strftime("%Y-%m-%d %H:%M IST")
+            last_ist  = datetime.fromtimestamp(ts_list[-1], tz=IST).strftime("%Y-%m-%d %H:%M IST")
+            console.print(f"   First   : {first_ist}")
+            console.print(f"   Last    : {last_ist}")
+            # Check for duplicates
+            dupes = len(ts_list) - len(set(ts_list))
+            if dupes:
+                console.print(f"   [red]⚠ {dupes} duplicate timestamps found![/red]")
+                errors += 1
+            else:
+                console.print(f"   [green]No duplicate timestamps ✅[/green]")
+        verified += 1
+    else:
+        console.print(f"[red]❌ Spot parquet NOT found: {SPOT_PARQUET}[/red]")
+        errors += 1
+
+    # 2. Options files
+    console.print()
+    pattern  = os.path.join(OPTIONS_DIR, f"expiry={year}-{month:02d}-*", "strike=*", "*.parquet")
+    opt_files = sorted(_glob.glob(pattern))
+    console.print(f"  Options parquet files found: [cyan]{len(opt_files)}[/cyan]")
+
+    if opt_files:
+        # Verify first 5 + last 5
+        sample = opt_files[:5] + (opt_files[-5:] if len(opt_files) > 5 else [])
+        console.print(f"\n  Spot-checking {len(sample)} files:\n")
+
+        required_opt = {"timestamp_ist","timestamp_unix","mark_open","mark_close","oi_open","oi_close"}
+        for fpath in sample:
+            try:
+                t = pq.read_table(fpath)
+                ts = t.column("timestamp_unix").to_pylist()
+                dupes = len(ts) - len(set(ts))
+                missing = required_opt - set(t.schema.names)
+                # Extract expiry and strike from path
+                parts = fpath.split(os.sep)
+                expiry_part = next((p for p in parts if p.startswith("expiry=")), "?")
+                strike_part = next((p for p in parts if p.startswith("strike=")), "?")
+                opt_type    = os.path.basename(fpath).replace(".parquet", "")
+                row_str = f"{len(t):5d} rows"
+                issues = []
+                if missing: issues.append(f"missing cols: {missing}")
+                if dupes:   issues.append(f"{dupes} dupes")
+                status_icon = "[red]❌[/red]" if issues else "[green]✅[/green]"
+                console.print(
+                    f"  {status_icon} {expiry_part} / {strike_part} / {opt_type}.parquet "
+                    f"— {row_str}"
+                    + (f"  [red]{'; '.join(issues)}[/red]" if issues else "")
+                )
+                if issues: errors += 1
+                else:       verified += 1
+            except Exception as e:
+                console.print(f"  [red]❌ {fpath}: {e}[/red]")
+                errors += 1
+    else:
+        console.print("  [red]❌ No options parquet files found![/red]")
+        errors += 1
+
+    # 3. Registry stats
+    console.print()
+    from registry import get_stats
+    stats = await get_stats()
+    console.print("[bold]Registry stats:[/bold]")
+    for status, data in sorted(stats.items()):
+        if isinstance(data, dict):
+            console.print(f"  {status:14s}: {data['count']:5d} symbols, {data.get('candles',0):8,} candles")
+        else:
+            console.print(f"  {status:14s}: {data}")
+
+    # 4. DuckDB quick query
+    console.print()
+    try:
+        import duckdb
+        if opt_files:
+            sample_file = opt_files[len(opt_files)//2]
+            con = duckdb.connect()
+            result = con.execute(f"""
+                SELECT
+                    MIN(timestamp_unix) as first_ts,
+                    MAX(timestamp_unix) as last_ts,
+                    COUNT(*) as rows,
+                    AVG(mark_close) as avg_mark,
+                    AVG(oi_close) as avg_oi
+                FROM read_parquet('{sample_file}')
+            """).fetchone()
+            con.close()
+            first = datetime.fromtimestamp(result[0], tz=IST).strftime("%Y-%m-%d %H:%M IST")
+            last  = datetime.fromtimestamp(result[1], tz=IST).strftime("%Y-%m-%d %H:%M IST")
+            console.print(f"[bold]DuckDB query on sample option file:[/bold]")
+            parts = sample_file.split(os.sep)
+            ep = next((p for p in parts if p.startswith("expiry=")), "?")
+            sp = next((p for p in parts if p.startswith("strike=")), "?")
+            console.print(f"  File       : {ep}/{sp}/{os.path.basename(sample_file)}")
+            console.print(f"  Rows       : {result[2]:,}")
+            console.print(f"  Time range : {first}  →  {last}")
+            console.print(f"  Avg mark   : ${result[3]:,.2f}" if result[3] else "  Avg mark   : N/A")
+            console.print(f"  Avg OI     : {result[4]:,.2f}" if result[4] else "  Avg OI     : N/A")
+            console.print(f"  [green]DuckDB query OK ✅[/green]")
+            verified += 1
+    except Exception as e:
+        console.print(f"  [red]DuckDB query failed: {e}[/red]")
+        errors += 1
+
+    # ── VERDICT ──────────────────────────────────────────────────────────────
+    console.print(f"\n{'='*60}")
+    if errors == 0:
+        console.print(f"[bold green]✅ TEST RUN PASSED — {verified} checks OK, 0 errors[/bold green]")
+        console.print(f"[green]Safe to run: python main.py collect  (all 5 accounts)[/green]")
+    else:
+        console.print(f"[bold red]❌ TEST RUN ISSUES — {errors} error(s), {verified} passed[/bold red]")
+        console.print(f"[yellow]Fix issues above before running full collection.[/yellow]")
+    console.print(f"{'='*60}\n")
+
+
 async def cmd_spot():
     from collector import fetch_spot_only
     console.print("[cyan]Fetching/updating spot data...[/cyan]")
@@ -355,6 +564,7 @@ def main():
         console.print("  test-depth — binary search for oldest data available")
         console.print("  spot       — fetch/update spot data only")
         console.print("  findings   — print verified test findings summary")
+        console.print("  test-run   — single-account test: 1 month + parquet verify")
         return
 
     cmd = sys.argv[1].lower()
@@ -378,9 +588,15 @@ def main():
     elif cmd == "spot":
         asyncio.run(cmd_spot())
 
+    elif cmd == "test-run":
+        # Single-account test: collect exactly one month then verify parquet output
+        # Usage: python main.py test-run [YYYY-MM]   default: most recent complete month
+        month = sys.argv[2] if len(sys.argv) > 2 else None
+        asyncio.run(cmd_test_run(month))
+
     else:
         console.print(f"[red]Unknown command: {cmd}[/red]")
-        console.print("Use: collect | resume | status | test-depth | spot | findings")
+        console.print("Use: collect | resume | status | test-depth | spot | findings | test-run")
         sys.exit(1)
 
 
