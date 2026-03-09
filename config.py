@@ -32,11 +32,11 @@ COLLECTION_START_DATE = date(2023, 12, 18)
 COLLECTION_END_DATE   = None    # None = today at runtime
 
 # ── Strike chain ──────────────────────────────────────────────────────────────
-# Test 3: $200 confirmed for live 2026 options (most common interval in chain).
-# Historical interval unknown — only 2026 expired products returned by /v2/products.
-# For historical collection, $200 is used as the best available estimate.
-DEFAULT_STRIKE_INTERVAL = 200
-CHAIN_HALF_WIDTH        = 20    # ATM ± 20 strikes = 41 unique strikes per snapshot
+# Test 3: live chain is non-uniform but denser near ATM at $100 intervals.
+# $100 rounding is more accurate than $200 (e.g. BTC=80050 → ATM=80100 not 80000).
+# ±40 strikes × $100 = same ±$4,000 range as before, but 2× density (81 strikes).
+DEFAULT_STRIKE_INTERVAL = 100
+CHAIN_HALF_WIDTH        = 40    # ATM ± 40 strikes = 81 unique strikes per snapshot
 
 # ── API limits ────────────────────────────────────────────────────────────────
 # Test 4: boundary is inclusive on both start and end.

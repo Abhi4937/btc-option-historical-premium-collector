@@ -3,8 +3,8 @@ Strike chain generation, expiry ladder, and BTC option symbol builder.
 
 VERIFIED FINDINGS:
   Test 2: Symbol format C-BTC-{strike}-{DDMMYY}, MARK: and OI: prefixes work
-  Test 3: Strike interval $200 (live 2026). Non-uniform grid (denser near ATM).
-           This module uses uniform $200 grid as best approximation for history.
+  Test 3: Strike interval non-uniform but $100 near ATM. Using $100 grid at ±40
+           strikes = 81 strikes per snapshot. More accurate ATM rounding than $200.
   Test 9: Expiry ladder verified against live exchange.
 """
 
@@ -17,13 +17,11 @@ from ist_utils import ddmmyy, get_expiry_ladder, first_appearance, now_ist
 log = logging.getLogger(__name__)
 
 
-def round_to_interval(price: float, interval: int) -> int:
-    """Round price to nearest multiple of interval."""
-    return round(price / interval) * interval
-
-
 def get_atm_strike(mark_close: float, interval: int = DEFAULT_STRIKE_INTERVAL) -> int:
-    return round_to_interval(mark_close, interval)
+    """Floor price to nearest lower multiple of interval.
+    e.g. $80,050 at interval=100 → $80,000 (not $80,100).
+    """
+    return int(mark_close / interval) * interval
 
 
 def get_strike_chain(
@@ -33,7 +31,7 @@ def get_strike_chain(
 ) -> list[int]:
     """
     Returns ATM ± half_width strikes = 2*half_width+1 unique strikes.
-    Default: ±20 × $200 = 41 strikes.
+    Default: ±40 × $100 = 81 strikes.
     """
     return [
         atm_strike + i * interval
