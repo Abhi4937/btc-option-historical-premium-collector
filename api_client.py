@@ -104,10 +104,12 @@ class DeltaAPIClient:
         self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self):
+        limits = httpx.Limits(max_connections=500, max_keepalive_connections=200)
         self._client = httpx.AsyncClient(
             base_url=BASE_URL,
             headers={"api-key": self.api_key},
             timeout=REQUEST_TIMEOUT_SECONDS,
+            limits=limits,
         )
         return self
 
