@@ -39,6 +39,37 @@ def get_registry():
     return {r[0]: {"count": r[1], "candles": r[2] or 0} for r in rows}, spot
 
 
+def get_month_breakdown():
+    import calendar
+    reg = sqlite3.connect(os.path.join(BASE_DIR, "db", "registry.db"))
+    man = sqlite3.connect(os.path.join(BASE_DIR, "db", "manifest.db"))
+
+    months = man.execute(
+        "SELECT expiry_month, status, claimed_by FROM manifest ORDER BY expiry_month"
+    ).fetchall()
+
+    result = []
+    for month, mstatus, claimed_by in months:
+        year, mo = int(month[:4]), int(month[5:7])
+        expected = calendar.monthrange(year, mo)[1]
+        rows = reg.execute('''
+            SELECT
+                COUNT(DISTINCT expiry_date),
+                SUM(CASE WHEN status="done"    THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status="empty"   THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status="pending" THEN 1 ELSE 0 END)
+            FROM symbols WHERE expiry_date LIKE ?
+        ''', (month + '%',)).fetchone()
+        expiries, done, empty, pending = rows[0] or 0, rows[1] or 0, rows[2] or 0, rows[3] or 0
+        total = done + empty + pending
+        pct = (done + empty) / total * 100 if total else 0
+        result.append((month, mstatus, claimed_by, expiries, expected, done, empty, pending, pct))
+
+    reg.close()
+    man.close()
+    return result
+
+
 def get_spot_size():
     path = os.path.join(BASE_DIR, "data", "spot", "BTCUSD_1min.parquet")
     if not os.path.exists(path):
@@ -67,6 +98,7 @@ def main():
     registry, spot_done = get_registry()
     spot_mb = get_spot_size()
     errors = get_recent_errors()
+    month_rows = get_month_breakdown()
 
     done_m    = manifest.get("done", 0)
     inprog_m  = manifest.get("in_progress", 0)
@@ -79,30 +111,37 @@ def main():
     sym_nl      = registry.get("not_listed", {}).get("count", 0)
     sym_pending = registry.get("pending", {}).get("count", 0)
     sym_fail    = registry.get("failed", {}).get("count", 0)
-    sym_inprog  = registry.get("in_progress", {}).get("count", 0)
     total_candles = sum(v["candles"] for v in registry.values())
 
     lines = [
         f"<b>BTC Collector Health — {now}</b>",
         "",
-        "<b>Months</b>",
-        f"  Done: {done_m}/{total_m}  |  In Progress: {inprog_m}  |  Pending: {pending_m}  |  Failed: {failed_m}",
-    ]
-
-    if in_prog:
-        lines.append("<b>Active months:</b>")
-        for month, acct in in_prog:
-            lines.append(f"  {month} → {acct}")
-
-    lines += [
+        "<b>Overall: {done_m}/{total_m} months done</b>".format(done_m=done_m, total_m=total_m),
+        f"  In Progress: {inprog_m}  |  Pending: {pending_m}  |  Failed: {failed_m}",
         "",
         "<b>Symbols</b>",
-        f"  Done: {sym_done}  |  Empty/NL: {sym_empty+sym_nl}  |  Pending: {sym_pending}  |  Failed: {sym_fail}  |  InProg: {sym_inprog}",
+        f"  Done: {sym_done:,}  |  Empty: {sym_empty+sym_nl:,}  |  Pending: {sym_pending:,}  |  Failed: {sym_fail}",
         f"  Total candles: {total_candles:,}",
         "",
         "<b>Spot</b>",
-        f"  Months with spot: {spot_done}  |  Parquet: {f'{spot_mb:.1f} MB' if spot_mb else 'missing'}",
+        f"  Months: {spot_done}  |  Parquet: {f'{spot_mb:.1f} MB' if spot_mb else 'missing'}",
+        "",
+        "<b>Month Breakdown</b>",
+        "<code>Month    Exp    Done   Empty  Pend    Pct</code>",
     ]
+
+    for month, mstatus, claimed_by, expiries, expected, done, empty, pending, pct in month_rows:
+        if mstatus == "pending":
+            continue
+        if mstatus == "done":
+            check = "✓" if pending == 0 and expiries == expected else f"⚠{expiries}/{expected}"
+            label = f"done {check}"
+        else:
+            owner = f"({claimed_by})" if claimed_by else ""
+            label = f"active {owner}"
+        lines.append(
+            f"<code>{month}  {expiries:2}/{expected:<2}  {done:5}  {empty:5}  {pending:5}  {pct:5.1f}%  {label}</code>"
+        )
 
     if failed:
         lines.append("")

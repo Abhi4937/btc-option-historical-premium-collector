@@ -35,11 +35,13 @@ async def _db(write: bool = False):
         async with _write_lock:
             async with aiosqlite.connect(REGISTRY_DB) as db:
                 await db.execute("PRAGMA journal_mode=WAL")
+                await db.execute("PRAGMA busy_timeout=30000")
                 db.row_factory = aiosqlite.Row
                 yield db
     else:
         async with aiosqlite.connect(REGISTRY_DB) as db:
             await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=30000")
             db.row_factory = aiosqlite.Row
             yield db
 

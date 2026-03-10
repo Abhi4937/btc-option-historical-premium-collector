@@ -325,21 +325,14 @@ class AccountWorker:
             return
 
         try:
-            # Test 6: check products API to distinguish empty vs not_listed
-            # Only check if we get 0 candles (to avoid extra API calls)
-
             mark_c, oi_c = await asyncio.gather(
                 client.fetch_candles(mark_sym, fetch_start_unix, expiry_unix),
                 client.fetch_candles(oi_sym, fetch_start_unix, expiry_unix),
             )
             if not mark_c and not oi_c:
-                # Test 6: both empty and fake return same response.
-                # Use products API to determine which case this is.
-                exists = await client.symbol_exists_in_products(raw_sym)
-                if exists:
-                    await mark_symbol_empty(mark_sym)
-                else:
-                    await mark_symbol_not_listed(mark_sym)
+                # All 40K+ resolved symbols show not_listed=0: Delta lists every
+                # $100-interval strike we generate. Skip products check, mark empty.
+                await mark_symbol_empty(mark_sym)
                 return
 
             # Merge and write

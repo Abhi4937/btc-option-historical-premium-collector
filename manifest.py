@@ -111,9 +111,8 @@ async def mark_month_done(month_key: str, account_name: str,
         await db.execute("""
             UPDATE manifest
             SET status='done', completed_at=?, total_calls=?, strikes_fetched=?
-            WHERE expiry_month=? AND claimed_by=?
-        """, (format_ist(now_ist()), total_calls, strikes_fetched,
-              month_key, account_name))
+            WHERE expiry_month=?
+        """, (format_ist(now_ist()), total_calls, strikes_fetched, month_key))
         await db.commit()
     log.info("[%s] Month %s DONE — calls=%d strikes=%d",
              account_name, month_key, total_calls, strikes_fetched)

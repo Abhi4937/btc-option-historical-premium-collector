@@ -13,7 +13,7 @@ VERIFIED FINDINGS incorporated:
            Must use count-based proactive rate limiting
   Test 8:  Data older than Jan 2024 returned empty — run test-depth for exact date
   Test 9:  Expiry ladder verified; 4 unique expiries always correct
-  Test 10: Rate limits are PER-ACCOUNT independent
+  Test 10: Rate limits are PER-IP (shared across accounts on same IP)
 """
 
 from datetime import date
@@ -45,12 +45,13 @@ MAX_CANDLES_PER_CALL = 2000
 
 # Test 7: NO rate-limit headers present — must count-limit proactively.
 # Official docs: 10,000 units per 5-min window, OHLC = 3 units per call.
-# => 10,000 / 3 = 3,333 real calls per 5-min window per account.
+# => 10,000 / 3 = 3,333 real calls per 5-min window TOTAL (per-IP, shared across accounts).
+# With 5 accounts on same IP: 3,333 / 5 = ~666 per account.
 RATE_LIMIT_CALLS_PER_WINDOW = 3_333
 RATE_LIMIT_WINDOW_SECONDS   = 300       # 5-minute fixed window
 
-# Buffer before hitting limit (stop at 90% to be safe)
-RATE_LIMIT_SAFE_CALLS = int(RATE_LIMIT_CALLS_PER_WINDOW * 0.90)   # ~5400
+# Per-account safe limit: 90% of (global limit / num accounts) = 3,333 * 0.90 / 5 = ~600
+RATE_LIMIT_SAFE_CALLS = 600
 
 # Sleep buffer on 429 (if we do hit it despite proactive limiting)
 RATE_LIMIT_429_BUFFER_MS = 500
