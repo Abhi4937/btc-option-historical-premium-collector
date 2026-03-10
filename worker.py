@@ -67,6 +67,7 @@ class AccountWorker:
         self._current_month   = None
         self._calls_this_month = 0
         self._strikes_fetched  = 0
+        self._sem             = asyncio.Semaphore(50)  # max concurrent HTTP calls per account
 
     def _update_status(self, **kwargs):
         if self.status_callback:
@@ -258,10 +259,8 @@ class AccountWorker:
         ]
         await register_symbols_batch(batch_rows)
 
-        sem = asyncio.Semaphore(400)
-
         async def _fetch_with_sem(opt_type, strike):
-            async with sem:
+            async with self._sem:
                 await self._fetch_option(
                     client, opt_type, strike, expiry_dt,
                     fetch_start_unix, expiry_unix, expiry_date_str,
