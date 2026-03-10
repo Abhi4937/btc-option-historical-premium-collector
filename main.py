@@ -36,18 +36,21 @@ from rich.table import Table
 from rich import box
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
-os.makedirs("logs", exist_ok=True)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import LOG_FILE, ERROR_LOG
+
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     handlers=[
-        logging.FileHandler("logs/collector.log"),
+        logging.FileHandler(LOG_FILE),
     ],
 )
 
 # Errors also go to separate file
-err_handler = logging.FileHandler("logs/errors.log")
+err_handler = logging.FileHandler(ERROR_LOG)
 err_handler.setLevel(logging.ERROR)
 err_handler.setFormatter(logging.Formatter(
     "%(asctime)s [%(name)s] %(levelname)s:\n%(message)s\n"

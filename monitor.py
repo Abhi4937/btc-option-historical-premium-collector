@@ -7,7 +7,9 @@ import sqlite3
 import os
 import sys
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # Add project dir to path so config is importable from anywhere
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -158,7 +160,7 @@ def get_recent_errors():
 
 
 def main():
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
 
     manifest, in_prog, failed = get_manifest()
     registry, spot_done = get_registry()
@@ -212,7 +214,7 @@ def main():
 
     if active_stats:
         lines.append("")
-        lines.append("<b>Active Workers</b>")
+        lines.append("<b>In-Progress Months</b>")
         lines.append("<code>Account       Month    Syms%   Exp saved  Last expiry</code>")
         for w in active_stats:
             lines.append(
