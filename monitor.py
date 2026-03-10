@@ -5,12 +5,16 @@ Run every 15 minutes via cron or manually.
 
 import sqlite3
 import os
+import sys
 import requests
 from datetime import datetime, timezone
 
+# Add project dir to path so config is importable from anywhere
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import MANIFEST_DB, REGISTRY_DB, SPOT_PARQUET, OPTIONS_DIR, LOGS_DIR
+
 BOT_TOKEN = "8675658345:AAEn9yIj3uZdu3TkPnXY2P1ubHgGMQc4COk"
 CHAT_ID   = "1088952172"
-BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 
 
 def send(msg: str):
@@ -19,7 +23,7 @@ def send(msg: str):
 
 
 def get_manifest():
-    db = sqlite3.connect(os.path.join(BASE_DIR, "db", "manifest.db"))
+    db = sqlite3.connect(MANIFEST_DB)
     rows = db.execute("SELECT status, COUNT(*) FROM manifest GROUP BY status").fetchall()
     in_prog = db.execute(
         "SELECT expiry_month, claimed_by FROM manifest WHERE status='in_progress' ORDER BY expiry_month"
@@ -32,7 +36,7 @@ def get_manifest():
 
 
 def get_registry():
-    db = sqlite3.connect(os.path.join(BASE_DIR, "db", "registry.db"))
+    db = sqlite3.connect(REGISTRY_DB)
     rows = db.execute("SELECT status, COUNT(*), SUM(total_candles) FROM symbols GROUP BY status").fetchall()
     spot = db.execute("SELECT COUNT(*) FROM spot_progress WHERE status='done'").fetchone()[0]
     db.close()
@@ -41,8 +45,8 @@ def get_registry():
 
 def get_month_breakdown():
     import calendar
-    reg = sqlite3.connect(os.path.join(BASE_DIR, "db", "registry.db"))
-    man = sqlite3.connect(os.path.join(BASE_DIR, "db", "manifest.db"))
+    reg = sqlite3.connect(REGISTRY_DB)
+    man = sqlite3.connect(MANIFEST_DB)
 
     months = man.execute(
         "SELECT expiry_month, status, claimed_by FROM manifest ORDER BY expiry_month"
@@ -70,16 +74,78 @@ def get_month_breakdown():
     return result
 
 
+def get_active_worker_stats():
+    """
+    For each in-progress month: symbol counts + parquet expiry coverage.
+    Returns list of dicts.
+    """
+    options_dir = OPTIONS_DIR
+    reg = sqlite3.connect(REGISTRY_DB)
+    man = sqlite3.connect(MANIFEST_DB)
+
+    months = man.execute(
+        "SELECT expiry_month, claimed_by FROM manifest WHERE status='in_progress' ORDER BY expiry_month"
+    ).fetchall()
+    man.close()
+
+    result = []
+    for expiry_month, claimed_by in months:
+        # Symbol counts
+        rows = reg.execute("""
+            SELECT status, COUNT(*) FROM symbols
+            WHERE substr(expiry_date,1,7)=?
+            GROUP BY status
+        """, (expiry_month,)).fetchall()
+        counts  = {s: c for s, c in rows}
+        done    = counts.get("done", 0)
+        empty   = counts.get("empty", 0)
+        pending = counts.get("pending", 0)
+        failed  = counts.get("failed", 0)
+        total   = done + empty + pending + failed
+        pct     = (done + empty) / total * 100 if total else 0.0
+
+        # Parquet expiry coverage
+        expected_dates = reg.execute("""
+            SELECT DISTINCT expiry_date FROM symbols
+            WHERE substr(expiry_date,1,7)=?
+            ORDER BY expiry_date
+        """, (expiry_month,)).fetchall()
+        expected_dates = [r[0] for r in expected_dates]
+
+        saved = []
+        for expiry_date in expected_dates:
+            folder = os.path.join(options_dir, f"expiry={expiry_date}")
+            if os.path.isdir(folder):
+                saved.append(expiry_date)
+
+        last_saved = saved[-1] if saved else None
+
+        result.append({
+            "month":      expiry_month,
+            "account":    claimed_by or "—",
+            "done":       done,
+            "empty":      empty,
+            "pending":    pending,
+            "failed":     failed,
+            "total":      total,
+            "pct":        pct,
+            "saved_exp":  len(saved),
+            "total_exp":  len(expected_dates),
+            "last_saved": last_saved,
+        })
+
+    reg.close()
+    return result
+
+
 def get_spot_size():
-    path = os.path.join(BASE_DIR, "data", "spot", "BTCUSD_1min.parquet")
-    if not os.path.exists(path):
+    if not os.path.exists(SPOT_PARQUET):
         return None
-    size_mb = os.path.getsize(path) / (1024 * 1024)
-    return size_mb
+    return os.path.getsize(SPOT_PARQUET) / (1024 * 1024)
 
 
 def get_recent_errors():
-    log_path = os.path.join(BASE_DIR, "logs", "collector.log")
+    log_path = os.path.join(LOGS_DIR, "collector.log")
     if not os.path.exists(log_path):
         return []
     errors = []
@@ -99,6 +165,7 @@ def main():
     spot_mb = get_spot_size()
     errors = get_recent_errors()
     month_rows = get_month_breakdown()
+    active_stats = get_active_worker_stats()
 
     done_m    = manifest.get("done", 0)
     inprog_m  = manifest.get("in_progress", 0)
@@ -142,6 +209,24 @@ def main():
         lines.append(
             f"<code>{month}  {expiries:2}/{expected:<2}  {done:5}  {empty:5}  {pending:5}  {pct:5.1f}%  {label}</code>"
         )
+
+    if active_stats:
+        lines.append("")
+        lines.append("<b>Active Workers</b>")
+        lines.append("<code>Account       Month    Syms%   Exp saved  Last expiry</code>")
+        for w in active_stats:
+            lines.append(
+                f"<code>{w['account']:<14}{w['month']}  {w['pct']:5.1f}%  "
+                f"{w['saved_exp']:2}/{w['total_exp']:<2}  "
+                f"{w['last_saved'] or '—'}</code>"
+            )
+        lines.append("")
+        lines.append("<code>Account       Month     Done   Empty  Pend   Failed</code>")
+        for w in active_stats:
+            lines.append(
+                f"<code>{w['account']:<14}{w['month']}  {w['done']:5}  {w['empty']:5}  "
+                f"{w['pending']:5}  {w['failed']:5}</code>"
+            )
 
     if failed:
         lines.append("")

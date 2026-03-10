@@ -78,12 +78,20 @@ PARQUET_ROW_GROUP_SIZE    = 10_000
 ACTIVE_ACCOUNTS = 5
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR     = os.path.join(BASE_DIR, "data")
-SPOT_DIR     = os.path.join(BASE_DIR, "data", "spot")
-OPTIONS_DIR  = os.path.join(BASE_DIR, "data", "options")
-DB_DIR       = os.path.join(BASE_DIR, "db")
-LOGS_DIR     = os.path.join(BASE_DIR, "logs")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# On Linux/WSL use native ext4 filesystem to avoid NTFS I/O errors under high concurrency.
+# On Windows (monitor.py) fall back to project directory.
+if os.name == "posix":
+    _DATA_BASE = os.path.expanduser("~/btc-data")
+else:
+    _DATA_BASE = BASE_DIR
+
+DATA_DIR     = os.path.join(_DATA_BASE, "data")
+SPOT_DIR     = os.path.join(_DATA_BASE, "data", "spot")
+OPTIONS_DIR  = os.path.join(_DATA_BASE, "data", "options")
+DB_DIR       = os.path.join(_DATA_BASE, "db")
+LOGS_DIR     = os.path.join(_DATA_BASE, "logs")
 
 MANIFEST_DB  = os.path.join(DB_DIR, "manifest.db")
 REGISTRY_DB  = os.path.join(DB_DIR, "registry.db")
