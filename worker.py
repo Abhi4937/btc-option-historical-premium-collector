@@ -75,7 +75,11 @@ class AccountWorker:
     async def run(self):
         """Main loop — claims and processes months until none remain."""
         log.info("[%s] Worker started", self.account_name)
-        async with DeltaAPIClient(self.account_name, self.api_key) as client:
+        def _on_call():
+            self._calls_this_month += 1
+            self._update_status(state="fetching", month=self._current_month,
+                                calls=self._calls_this_month)
+        async with DeltaAPIClient(self.account_name, self.api_key, on_call=_on_call) as client:
             while True:
                 month_key = await claim_next_month(self.account_name)
                 if month_key is None:
@@ -254,13 +258,17 @@ class AccountWorker:
         ]
         await register_symbols_batch(batch_rows)
 
+        sem = asyncio.Semaphore(400)
+
+        async def _fetch_with_sem(opt_type, strike):
+            async with sem:
+                await self._fetch_option(
+                    client, opt_type, strike, expiry_dt,
+                    fetch_start_unix, expiry_unix, expiry_date_str,
+                )
+
         tasks = [
-            self._fetch_option(
-                client,
-                opt_type, strike, expiry_dt,
-                fetch_start_unix, expiry_unix,
-                expiry_date_str,
-            )
+            _fetch_with_sem(opt_type, strike)
             for strike in strikes
             for opt_type in ("CE", "PE")
         ]
@@ -325,12 +333,6 @@ class AccountWorker:
                 client.fetch_candles(mark_sym, fetch_start_unix, expiry_unix),
                 client.fetch_candles(oi_sym, fetch_start_unix, expiry_unix),
             )
-            self._calls_this_month += 2
-            self._update_status(
-                state="fetching", month=self._current_month,
-                calls=self._calls_this_month, symbol=mark_sym,
-            )
-
             if not mark_c and not oi_c:
                 # Test 6: both empty and fake return same response.
                 # Use products API to determine which case this is.

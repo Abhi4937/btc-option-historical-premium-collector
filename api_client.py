@@ -40,13 +40,15 @@ class RateLimiter:
 
     def __init__(self, account_name: str,
                  max_calls: int = RATE_LIMIT_SAFE_CALLS,
-                 window_seconds: int = RATE_LIMIT_WINDOW_SECONDS):
+                 window_seconds: int = RATE_LIMIT_WINDOW_SECONDS,
+                 on_call=None):
         self.account_name    = account_name
         self.max_calls       = max_calls
         self.window_seconds  = window_seconds
         self._timestamps: deque[float] = deque()
         self._total_calls    = 0
         self._lock           = asyncio.Lock()
+        self._on_call        = on_call  # callback fired on every acquired call
 
     async def acquire(self):
         """Wait if necessary, then record this call."""
@@ -75,6 +77,8 @@ class RateLimiter:
 
             self._timestamps.append(time.monotonic())
             self._total_calls += 1
+            if self._on_call:
+                self._on_call()
 
     @property
     def calls_in_window(self) -> int:
@@ -93,10 +97,10 @@ class DeltaAPIClient:
     One instance per worker account.
     """
 
-    def __init__(self, account_name: str, api_key: str):
+    def __init__(self, account_name: str, api_key: str, on_call=None):
         self.account_name = account_name
         self.api_key      = api_key
-        self.rate_limiter = RateLimiter(account_name)
+        self.rate_limiter = RateLimiter(account_name, on_call=on_call)
         self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self):
