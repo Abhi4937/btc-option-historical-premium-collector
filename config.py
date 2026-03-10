@@ -44,13 +44,13 @@ CHAIN_HALF_WIDTH        = 40    # ATM ± 40 strikes = 81 unique strikes per snap
 MAX_CANDLES_PER_CALL = 2000
 
 # Test 7: NO rate-limit headers present — must count-limit proactively.
-# Per domain knowledge: 3 units per OHLC call, 10,000 units per 5-min window.
-# Max calls/5min/account = 10000 / 3 = 3333
+# Official docs: 10,000 units per 5-min window, OHLC = 3 units per call.
+# => 10,000 / 3 = 3,333 real calls per 5-min window per account.
 RATE_LIMIT_CALLS_PER_WINDOW = 3_333
 RATE_LIMIT_WINDOW_SECONDS   = 300       # 5-minute fixed window
 
-# Buffer before hitting limit (stop at 95% to be safe)
-RATE_LIMIT_SAFE_CALLS = int(RATE_LIMIT_CALLS_PER_WINDOW * 0.95)   # ~3166
+# Buffer before hitting limit (stop at 90% to be safe)
+RATE_LIMIT_SAFE_CALLS = int(RATE_LIMIT_CALLS_PER_WINDOW * 0.90)   # ~5400
 
 # Sleep buffer on 429 (if we do hit it despite proactive limiting)
 RATE_LIMIT_429_BUFFER_MS = 500

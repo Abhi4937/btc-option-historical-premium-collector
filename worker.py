@@ -24,6 +24,7 @@ import logging
 import traceback
 from datetime import timedelta
 
+
 from api_client import DeltaAPIClient
 from config import (
     DEFAULT_STRIKE_INTERVAL, CHAIN_HALF_WIDTH, SETTLEMENT_EXTRA_SECONDS,
@@ -42,8 +43,7 @@ from parquet_writer import (
 from registry import (
     register_symbol, mark_symbol_done, mark_symbol_empty,
     mark_symbol_not_listed, mark_symbol_failed, mark_symbol_in_progress,
-    get_symbol_status, upsert_expiry_strike, get_strikes_for_expiry,
-    mark_spot_done, is_spot_done,
+    get_symbol_status, mark_spot_done, is_spot_done,
 )
 from strike_generator import (
     get_atm_strike, get_strike_chain,
@@ -98,7 +98,7 @@ class AccountWorker:
                                         calls=self._calls_this_month)
                 except Exception as e:
                     err = traceback.format_exc()
-                    log.error("[%s] Month %s FAILED: %s", self.account_name, month_key, e)
+                    log.error("[%s] Month %s FAILED: %s\n%s", self.account_name, month_key, e, err)
                     await mark_month_failed(month_key, self.account_name, str(e))
                     self._update_status(state="failed", month=month_key, error=str(e))
 
@@ -139,15 +139,23 @@ class AccountWorker:
             if c.get("mark_close") is not None:
                 mark_by_unix[c["timestamp_unix"]] = c["mark_close"]
 
-        # Step 2: process each expiry date in this month
-        expiry_dts = all_expiry_dates_in_month(year, month)
+        # Step 2: build strike unions for ALL expiries first, then fetch all in parallel
+        expiry_dts = [
+            e for e in all_expiry_dates_in_month(year, month)
+            if e <= now_ist()
+        ]
+
+        # Build strike unions for all expiries in memory, then fetch all in parallel
+        expiry_strikes: dict[str, dict[int, int]] = {}
         for expiry_dt in expiry_dts:
-            if expiry_dt > now_ist():
-                # Don't try to collect future expiries
-                continue
-            await self._process_expiry(
-                client, expiry_dt, mark_by_unix, range_start
-            )
+            strikes = await self._build_strike_union(expiry_dt, first_appearance(expiry_dt), mark_by_unix)
+            expiry_strikes[expiry_dt.date().isoformat()] = strikes
+
+        await asyncio.gather(*[
+            self._process_expiry(client, expiry_dt, mark_by_unix, range_start,
+                                 expiry_strikes[expiry_dt.date().isoformat()])
+            for expiry_dt in expiry_dts
+        ])
 
     async def _ensure_spot_data(
         self,
@@ -198,7 +206,6 @@ class AccountWorker:
                         self.account_name, month_key)
             return []
 
-        # Merge into unified format
         table = merge_spot_data(mark_c, ltp_c, oi_c)
         append_or_create_spot(table, SPOT_PARQUET)
         await mark_spot_done(month_key, len(table))
@@ -211,12 +218,12 @@ class AccountWorker:
         expiry_dt,
         mark_by_unix: dict[int, float],
         range_start,
+        strikes: dict[int, int],  # strike → first_seen_unix (passed from memory)
     ):
         """
         For a single expiry date:
           1. Compute first_appearance
-          2. Build ATM union → expiry_strikes
-          3. Fetch each (strike, CE/PE) symbol
+          2. Fetch each (strike, CE/PE) symbol using in-memory strikes
         """
         expiry_date_str = expiry_dt.date().isoformat()
         appear_dt       = first_appearance(expiry_dt)
@@ -225,49 +232,42 @@ class AccountWorker:
         log.info("[%s] Expiry %s: first_appearance=%s",
                  self.account_name, expiry_date_str, format_ist(appear_dt))
 
-        # Build union of ATM strikes across the expiry's lifetime
-        await self._build_strike_union(
-            expiry_dt, appear_dt, mark_by_unix
-        )
-
-        # Get all registered strikes for this expiry
-        strike_rows = await get_strikes_for_expiry(expiry_date_str)
-        if not strike_rows:
+        if not strikes:
             log.warning("[%s] No strikes found for expiry %s",
                         self.account_name, expiry_date_str)
             return
 
         log.info("[%s] Expiry %s: %d strikes to fetch",
-                 self.account_name, expiry_date_str, len(strike_rows))
+                 self.account_name, expiry_date_str, len(strikes))
 
         fetch_start_unix = ist_to_unix(appear_dt)
 
-        for row in strike_rows:
-            strike = row["strike"]
-            for opt_type in ("CE", "PE"):
-                await self._fetch_option(
-                    client,
-                    opt_type, strike, expiry_dt,
-                    fetch_start_unix, expiry_unix,
-                    expiry_date_str,
-                )
+        tasks = [
+            self._fetch_option(
+                client,
+                opt_type, strike, expiry_dt,
+                fetch_start_unix, expiry_unix,
+                expiry_date_str,
+            )
+            for strike in strikes
+            for opt_type in ("CE", "PE")
+        ]
+        await asyncio.gather(*tasks)
 
     async def _build_strike_union(
         self,
         expiry_dt,
         appear_dt,
         mark_by_unix: dict[int, float],
-    ):
+    ) -> dict[int, int]:
         """
         Scan mark prices from appear_dt to expiry_dt.
-        For each minute, compute ATM ± 20 chain.
-        Union all strikes → upsert into expiry_strikes table.
+        For each minute, compute ATM ± chain.
+        Returns dict of strike → first_seen_unix (pure in-memory, no DB writes).
         """
-        expiry_date_str = expiry_dt.date().isoformat()
-        appear_unix     = ist_to_unix(appear_dt)
-        expiry_unix     = ist_to_unix(expiry_dt)
+        appear_unix = ist_to_unix(appear_dt)
+        expiry_unix = ist_to_unix(expiry_dt)
 
-        new_strikes: set[int] = set()
         first_seen_by_strike: dict[int, int] = {}
 
         for ts, mark_close in sorted(mark_by_unix.items()):
@@ -279,18 +279,11 @@ class AccountWorker:
             for s in chain:
                 if s not in first_seen_by_strike:
                     first_seen_by_strike[s] = ts
-                new_strikes.add(s)
-
-        for strike, first_unix in first_seen_by_strike.items():
-            await upsert_expiry_strike(
-                expiry_date_str,
-                strike,
-                format_ist(unix_to_ist(first_unix)),
-                first_unix,
-            )
 
         log.debug("[%s] Expiry %s: %d unique strikes in union",
-                  self.account_name, expiry_date_str, len(new_strikes))
+                  self.account_name, expiry_dt.date().isoformat(), len(first_seen_by_strike))
+
+        return first_seen_by_strike
 
     async def _fetch_option(
         self,
@@ -329,15 +322,15 @@ class AccountWorker:
             # Test 6: check products API to distinguish empty vs not_listed
             # Only check if we get 0 candles (to avoid extra API calls)
 
-            mark_c = await client.fetch_candles(mark_sym, fetch_start_unix, expiry_unix)
-            self._calls_this_month += 1
+            mark_c, oi_c = await asyncio.gather(
+                client.fetch_candles(mark_sym, fetch_start_unix, expiry_unix),
+                client.fetch_candles(oi_sym, fetch_start_unix, expiry_unix),
+            )
+            self._calls_this_month += 2
             self._update_status(
                 state="fetching", month=self._current_month,
                 calls=self._calls_this_month, symbol=mark_sym,
             )
-
-            oi_c = await client.fetch_candles(oi_sym, fetch_start_unix, expiry_unix)
-            self._calls_this_month += 1
 
             if not mark_c and not oi_c:
                 # Test 6: both empty and fake return same response.

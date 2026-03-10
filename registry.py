@@ -10,13 +10,39 @@ VERIFIED FINDING — Test 6:
     3. Both statuses are terminal (never retried)
 """
 
+import asyncio
 import aiosqlite
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from config import REGISTRY_DB, STATUS_PENDING, STATUS_IN_PROGRESS, STATUS_DONE
 from config import STATUS_EMPTY, STATUS_NOT_LISTED, STATUS_FAILED
 from ist_utils import format_ist, now_ist
+
+
+_write_lock = asyncio.Lock()
+
+
+@asynccontextmanager
+async def _db(write: bool = False):
+    """
+    Open a registry DB connection.
+    write=True acquires a process-level asyncio lock to serialize concurrent writers,
+    preventing 'database is locked' under high parallelism.
+    """
+    if write:
+        async with _write_lock:
+            async with aiosqlite.connect(REGISTRY_DB) as db:
+                await db.execute("PRAGMA journal_mode=WAL")
+                db.row_factory = aiosqlite.Row
+                yield db
+    else:
+        async with aiosqlite.connect(REGISTRY_DB) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            db.row_factory = aiosqlite.Row
+            yield db
+
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +85,7 @@ CREATE TABLE IF NOT EXISTS spot_progress (
 
 
 async def init_registry():
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db(write=True) as db:
         await db.execute(CREATE_SYMBOLS_SQL)
         await db.execute(CREATE_EXPIRY_STRIKES_SQL)
         await db.execute(CREATE_SPOT_PROGRESS_SQL)
@@ -81,7 +107,7 @@ async def register_symbol(
     claimed_by: str,
 ):
     """Insert symbol if not already present. Skips if exists."""
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db(write=True) as db:
         await db.execute("""
             INSERT OR IGNORE INTO symbols
               (symbol, expiry_date, strike, option_type,
@@ -93,7 +119,7 @@ async def register_symbol(
 
 
 async def mark_symbol_done(symbol: str, total_candles: int, parquet_path: str):
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db(write=True) as db:
         await db.execute("""
             UPDATE symbols
             SET status='done', total_candles=?, parquet_path=?, fetched_at=?
@@ -104,7 +130,7 @@ async def mark_symbol_done(symbol: str, total_candles: int, parquet_path: str):
 
 async def mark_symbol_empty(symbol: str):
     """HTTP 200 + [] — symbol listed but no candle data."""
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db(write=True) as db:
         await db.execute(
             "UPDATE symbols SET status='empty', fetched_at=? WHERE symbol=?",
             (format_ist(now_ist()), symbol)
@@ -114,7 +140,7 @@ async def mark_symbol_empty(symbol: str):
 
 async def mark_symbol_not_listed(symbol: str):
     """Symbol not found in /v2/products — never retry."""
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db(write=True) as db:
         await db.execute(
             "UPDATE symbols SET status='not_listed', fetched_at=? WHERE symbol=?",
             (format_ist(now_ist()), symbol)
@@ -123,7 +149,7 @@ async def mark_symbol_not_listed(symbol: str):
 
 
 async def mark_symbol_failed(symbol: str, error: str):
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db(write=True) as db:
         await db.execute("""
             UPDATE symbols SET status='failed', fetched_at=?
             WHERE symbol=?
@@ -133,7 +159,7 @@ async def mark_symbol_failed(symbol: str, error: str):
 
 
 async def mark_symbol_in_progress(symbol: str):
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db(write=True) as db:
         await db.execute(
             "UPDATE symbols SET status='in_progress' WHERE symbol=?",
             (symbol,)
@@ -142,7 +168,7 @@ async def mark_symbol_in_progress(symbol: str):
 
 
 async def get_symbol_status(symbol: str) -> str | None:
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db() as db:
         async with db.execute(
             "SELECT status FROM symbols WHERE symbol=?", (symbol,)
         ) as cur:
@@ -152,8 +178,7 @@ async def get_symbol_status(symbol: str) -> str | None:
 
 async def get_pending_symbols_for_expiry(expiry_date: str) -> list[dict]:
     """Returns all symbols for an expiry that still need fetching."""
-    async with aiosqlite.connect(REGISTRY_DB) as db:
-        db.row_factory = aiosqlite.Row
+    async with _db() as db:
         async with db.execute("""
             SELECT * FROM symbols
             WHERE expiry_date=? AND status IN ('pending', 'failed')
@@ -164,7 +189,7 @@ async def get_pending_symbols_for_expiry(expiry_date: str) -> list[dict]:
 
 async def reset_stale_in_progress():
     """Reset symbols stuck in in_progress → pending (used by resume command)."""
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db(write=True) as db:
         cur = await db.execute(
             "UPDATE symbols SET status='pending' WHERE status='in_progress'"
         )
@@ -175,40 +200,11 @@ async def reset_stale_in_progress():
 
 # ── Expiry strikes tracking ───────────────────────────────────────────────────
 
-async def upsert_expiry_strike(
-    expiry_date: str,
-    strike: int,
-    first_seen_ist: str,
-    first_seen_unix: int,
-):
-    """Insert new expiry-strike pair, or update last_seen if already present."""
-    async with aiosqlite.connect(REGISTRY_DB) as db:
-        await db.execute("""
-            INSERT INTO expiry_strikes
-              (expiry_date, strike, first_seen_ist, first_seen_unix, last_seen_ist)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(expiry_date, strike) DO UPDATE
-            SET last_seen_ist=excluded.last_seen_ist
-        """, (expiry_date, strike, first_seen_ist, first_seen_unix,
-              format_ist(now_ist())))
-        await db.commit()
-
-
-async def get_strikes_for_expiry(expiry_date: str) -> list[dict]:
-    async with aiosqlite.connect(REGISTRY_DB) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("""
-            SELECT * FROM expiry_strikes WHERE expiry_date=?
-            ORDER BY strike
-        """, (expiry_date,)) as cur:
-            rows = await cur.fetchall()
-            return [dict(r) for r in rows]
-
 
 # ── Spot progress ─────────────────────────────────────────────────────────────
 
 async def mark_spot_done(month_key: str, candles_written: int):
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db(write=True) as db:
         await db.execute("""
             INSERT OR REPLACE INTO spot_progress
               (date_range_key, status, candles_written, fetched_at)
@@ -218,7 +214,7 @@ async def mark_spot_done(month_key: str, candles_written: int):
 
 
 async def is_spot_done(month_key: str) -> bool:
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db() as db:
         async with db.execute(
             "SELECT status FROM spot_progress WHERE date_range_key=?",
             (month_key,)
@@ -230,7 +226,7 @@ async def is_spot_done(month_key: str) -> bool:
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 async def get_stats() -> dict:
-    async with aiosqlite.connect(REGISTRY_DB) as db:
+    async with _db() as db:
         async with db.execute("""
             SELECT status, COUNT(*) as cnt, SUM(total_candles) as total
             FROM symbols GROUP BY status
