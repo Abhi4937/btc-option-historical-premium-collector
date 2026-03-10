@@ -242,8 +242,18 @@ def main():
         for e in errors:
             lines.append(f"  {e[:100]}")
 
-    send("\n".join(lines))
-    print("Sent to Telegram.")
+    msg = "\n".join(lines)
+    # Strip HTML tags for terminal display
+    import re
+    plain = re.sub(r"<[^>]+>", "", msg)
+
+    if "--print" in sys.argv:
+        print(plain)
+    else:
+        send(msg)
+        print("Sent to Telegram.")
+        print()
+        print(plain)
 
 
 if __name__ == "__main__":
