@@ -97,24 +97,20 @@ async def init_registry():
 
 # ── Symbol registration ───────────────────────────────────────────────────────
 
-async def register_symbol(
-    symbol: str,
-    expiry_date: str,
-    strike: int,
-    option_type: str,
-    from_time_ist: str,
-    to_time_ist: str,
-    claimed_by: str,
-):
-    """Insert symbol if not already present. Skips if exists."""
+async def register_symbols_batch(rows: list[tuple]):
+    """
+    Batch insert all symbols for a month in one transaction.
+    Each row: (symbol, expiry_date, strike, option_type,
+               from_time_ist, to_time_ist, claimed_by)
+    Skips symbols that already exist.
+    """
     async with _db(write=True) as db:
-        await db.execute("""
+        await db.executemany("""
             INSERT OR IGNORE INTO symbols
               (symbol, expiry_date, strike, option_type,
                from_time_ist, to_time_ist, claimed_by, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (symbol, expiry_date, strike, option_type,
-              from_time_ist, to_time_ist, claimed_by, STATUS_PENDING))
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+        """, rows)
         await db.commit()
 
 
@@ -158,15 +154,6 @@ async def mark_symbol_failed(symbol: str, error: str):
     log.error("Symbol FAILED: %s — %s", symbol, error)
 
 
-async def mark_symbol_in_progress(symbol: str):
-    async with _db(write=True) as db:
-        await db.execute(
-            "UPDATE symbols SET status='in_progress' WHERE symbol=?",
-            (symbol,)
-        )
-        await db.commit()
-
-
 async def get_symbol_status(symbol: str) -> str | None:
     async with _db() as db:
         async with db.execute(
@@ -176,26 +163,10 @@ async def get_symbol_status(symbol: str) -> str | None:
             return row[0] if row else None
 
 
-async def get_pending_symbols_for_expiry(expiry_date: str) -> list[dict]:
-    """Returns all symbols for an expiry that still need fetching."""
-    async with _db() as db:
-        async with db.execute("""
-            SELECT * FROM symbols
-            WHERE expiry_date=? AND status IN ('pending', 'failed')
-        """, (expiry_date,)) as cur:
-            rows = await cur.fetchall()
-            return [dict(r) for r in rows]
-
 
 async def reset_stale_in_progress():
-    """Reset symbols stuck in in_progress → pending (used by resume command)."""
-    async with _db(write=True) as db:
-        cur = await db.execute(
-            "UPDATE symbols SET status='pending' WHERE status='in_progress'"
-        )
-        await db.commit()
-        log.info("Reset %d stale in_progress symbols → pending", cur.rowcount)
-        return cur.rowcount
+    """No-op — in_progress status removed. Kept for API compatibility."""
+    return 0
 
 
 # ── Expiry strikes tracking ───────────────────────────────────────────────────

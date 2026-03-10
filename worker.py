@@ -41,8 +41,8 @@ from parquet_writer import (
     append_or_create_spot, append_or_create_option,
 )
 from registry import (
-    register_symbol, mark_symbol_done, mark_symbol_empty,
-    mark_symbol_not_listed, mark_symbol_failed, mark_symbol_in_progress,
+    register_symbols_batch, mark_symbol_done, mark_symbol_empty,
+    mark_symbol_not_listed, mark_symbol_failed,
     get_symbol_status, mark_spot_done, is_spot_done,
 )
 from strike_generator import (
@@ -241,6 +241,18 @@ class AccountWorker:
                  self.account_name, expiry_date_str, len(strikes))
 
         fetch_start_unix = ist_to_unix(appear_dt)
+        from_ist = format_ist(unix_to_ist(fetch_start_unix))
+        to_ist   = format_ist(unix_to_ist(expiry_unix))
+
+        # Batch register all symbols in one DB transaction before fetching
+        batch_rows = [
+            (build_mark_symbol(opt_type, strike, expiry_dt),
+             expiry_date_str, strike, opt_type,
+             from_ist, to_ist, self.account_name)
+            for strike in strikes
+            for opt_type in ("CE", "PE")
+        ]
+        await register_symbols_batch(batch_rows)
 
         tasks = [
             self._fetch_option(
@@ -300,23 +312,10 @@ class AccountWorker:
         oi_sym   = build_oi_symbol(opt_type, strike, expiry_dt)
         raw_sym  = build_option_symbol(opt_type, strike, expiry_dt)
 
-        # Register if not already in registry
-        await register_symbol(
-            symbol       = mark_sym,
-            expiry_date  = expiry_date_str,
-            strike       = strike,
-            option_type  = opt_type,
-            from_time_ist= format_ist(unix_to_ist(fetch_start_unix)),
-            to_time_ist  = format_ist(unix_to_ist(expiry_unix)),
-            claimed_by   = self.account_name,
-        )
-
         # Skip if already done/empty/not_listed
         status = await get_symbol_status(mark_sym)
         if status in (STATUS_DONE, STATUS_EMPTY, STATUS_NOT_LISTED):
             return
-
-        await mark_symbol_in_progress(mark_sym)
 
         try:
             # Test 6: check products API to distinguish empty vs not_listed
