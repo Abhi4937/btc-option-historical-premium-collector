@@ -484,6 +484,184 @@ async def cmd_spot():
     console.print("[green]Spot data update complete.[/green]")
 
 
+async def cmd_backfill_fridays():
+    """
+    Backfill missing early candles for Friday expiry symbols.
+
+    For each done Friday symbol:
+      1. Compute new first_appearance using extended 8-slot ladder (70-day probe)
+      2. Read existing parquet to find earliest stored timestamp
+      3. Fetch ONLY the gap: new_start → existing_earliest - 1s
+      4. Merge into existing parquet (deduplicated — no redundant data written)
+    """
+    import pyarrow.parquet as pq
+    import aiosqlite
+    from datetime import date as date_cls
+    from collections import defaultdict
+    from dotenv import load_dotenv
+    from api_client import DeltaAPIClient
+    from parquet_writer import merge_option_data, append_or_create_option
+    from registry import init_registry
+    from ist_utils import first_appearance, get_expiry_dt, ist_to_unix
+    from config import REGISTRY_DB
+
+    load_dotenv()
+    key = os.getenv("ACCOUNT_1_KEY")
+    if not key:
+        console.print("[red]ACCOUNT_1_KEY not found in .env[/red]")
+        return
+
+    await init_registry()
+
+    # ── 1. Find all done Friday symbols ───────────────────────────────────────
+    async with aiosqlite.connect(REGISTRY_DB) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT symbol, expiry_date, strike, option_type, parquet_path, fetched_from_unix "
+            "FROM symbols WHERE status = 'done'"
+        ) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+
+    friday_rows = [
+        r for r in rows
+        if date_cls.fromisoformat(r['expiry_date']).weekday() == 4
+    ]
+    console.print(f"[cyan]Done Friday symbols found: {len(friday_rows)}[/cyan]")
+
+    # ── 2. One-time: populate fetched_from_unix for symbols that don't have it ─
+    from registry import update_fetched_from_unix
+    null_rows = [r for r in friday_rows if r['fetched_from_unix'] is None]
+    if null_rows:
+        console.print(f"[yellow]One-time: reading {len(null_rows)} parquet files to populate DB...[/yellow]")
+        for r in null_rows:
+            path = r['parquet_path']
+            if not path or not os.path.exists(path):
+                continue
+            t = pq.read_table(path, columns=["timestamp_unix"])
+            if len(t) == 0:
+                continue
+            earliest = t.column("timestamp_unix")[0].as_py()
+            r['fetched_from_unix'] = earliest
+            await update_fetched_from_unix(r['symbol'], earliest)
+        console.print(f"[green]DB populated — future runs will skip parquet reads entirely.[/green]\n")
+
+    # ── 3. Compute gap per symbol using DB value ───────────────────────────────
+    gaps = []
+    for r in friday_rows:
+        existing_earliest = r['fetched_from_unix']
+        if not existing_earliest:
+            continue
+
+        expiry_dt      = get_expiry_dt(date_cls.fromisoformat(r['expiry_date']))
+        new_start      = first_appearance(expiry_dt)
+        new_start_unix = ist_to_unix(new_start)
+
+        if new_start_unix < existing_earliest:
+            gaps.append({
+                **r,
+                "new_start_unix": new_start_unix,
+                "fetch_end_unix": existing_earliest - 1,
+                "gap_days":       (existing_earliest - new_start_unix) / 86400,
+            })
+
+    if not gaps:
+        console.print("[green]Nothing to backfill — all Friday symbols have full history.[/green]")
+        return
+
+    # ── 3. Print summary ───────────────────────────────────────────────────────
+    by_expiry: dict = defaultdict(list)
+    for g in gaps:
+        by_expiry[g['expiry_date']].append(g)
+
+    console.print(
+        f"[yellow]{len(gaps)} symbols across {len(by_expiry)} Friday expiries need backfill[/yellow]\n"
+    )
+    console.print("[bold]Expiry breakdown:[/bold]")
+    for expiry in sorted(by_expiry):
+        syms    = by_expiry[expiry]
+        avg_gap = sum(s['gap_days'] for s in syms) / len(syms)
+        console.print(f"  {expiry}  {len(syms):4d} symbols  avg gap {avg_gap:.1f} days")
+
+    console.print(f"\n[cyan]Starting backfill with account lava...[/cyan]\n")
+
+    # ── 4. Progress state file (read by monitor.py) ───────────────────────────
+    import json
+    from config import LOGS_DIR
+    progress_file = os.path.join(LOGS_DIR, "backfill_progress.json")
+    total_expiries = len(by_expiry)
+    total_symbols  = len(gaps)
+
+    def _save_progress(done_exp: int, done_sym: int, no_data_sym: int,
+                       err_sym: int, current: str, status: str):
+        data = {
+            "status":          status,
+            "started_at":      datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"),
+            "total_expiries":  total_expiries,
+            "total_symbols":   total_symbols,
+            "done_expiries":   done_exp,
+            "done_symbols":    done_sym,
+            "no_data_symbols": no_data_sym,
+            "error_symbols":   err_sym,
+            "current_expiry":  current,
+            "last_updated":    datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"),
+        }
+        with open(progress_file, "w") as f:
+            json.dump(data, f)
+
+    # ── 5. Fetch gaps and merge ────────────────────────────────────────────────
+    filled      = 0
+    no_data     = 0
+    errors      = 0
+    done_exp    = 0
+    sem         = asyncio.Semaphore(50)
+
+    async def _do_one(g: dict, client: DeltaAPIClient):
+        nonlocal filled, no_data, errors
+        async with sem:
+            try:
+                mark_sym = g['symbol']
+                oi_sym   = mark_sym.replace("MARK:", "OI:", 1)
+
+                mark_c, oi_c = await asyncio.gather(
+                    client.fetch_candles(mark_sym, g['new_start_unix'], g['fetch_end_unix']),
+                    client.fetch_candles(oi_sym,   g['new_start_unix'], g['fetch_end_unix']),
+                )
+                if not mark_c and not oi_c:
+                    no_data += 1
+                    return
+
+                table = merge_option_data(mark_c, oi_c)
+                append_or_create_option(table, g['expiry_date'], g['strike'], g['option_type'])
+                if len(table) > 0:
+                    new_earliest = table.column("timestamp_unix")[0].as_py()
+                    await update_fetched_from_unix(g['symbol'], new_earliest)
+                filled += 1
+            except Exception as e:
+                log.error("Backfill failed %s: %s", g['symbol'], e)
+                errors += 1
+
+    _save_progress(0, 0, 0, 0, "starting", "running")
+
+    async with DeltaAPIClient("lava", key) as client:
+        for expiry in sorted(by_expiry):
+            syms  = by_expiry[expiry]
+            _save_progress(done_exp, filled, no_data, errors, expiry, "running")
+            await asyncio.gather(*[_do_one(g, client) for g in syms])
+            done_exp += 1
+            rl = client.rate_limiter
+            console.print(
+                f"  [green]✓[/green] {expiry}  ({len(syms)} symbols)  "
+                f"| rate: {rl.calls_in_window}/{rl.max_calls} in window  "
+                f"total: {rl.total_calls}"
+            )
+
+    _save_progress(done_exp, filled, no_data, errors, "—", "complete")
+    console.print(
+        f"\n[bold]Backfill complete:[/bold] "
+        f"{filled} updated  {no_data} no-data  {errors} errors"
+    )
+
+
 # ── FINAL VERIFIED FINDINGS ───────────────────────────────────────────────────
 
 FINAL_SUMMARY = """
@@ -560,13 +738,14 @@ def main():
     if len(sys.argv) < 2:
         console.print(__doc__)
         console.print("[bold cyan]Available commands:[/bold cyan]")
-        console.print("  collect    — full 5-account parallel collection")
-        console.print("  resume     — reset stale jobs and continue")
-        console.print("  status     — show manifest + registry progress")
-        console.print("  test-depth — binary search for oldest data available")
-        console.print("  spot       — fetch/update spot data only")
-        console.print("  findings   — print verified test findings summary")
-        console.print("  test-run   — single-account test: 1 month + parquet verify")
+        console.print("  collect           — full 5-account parallel collection")
+        console.print("  resume            — reset stale jobs and continue")
+        console.print("  status            — show manifest + registry progress")
+        console.print("  test-depth        — binary search for oldest data available")
+        console.print("  spot              — fetch/update spot data only")
+        console.print("  findings          — print verified test findings summary")
+        console.print("  test-run          — single-account test: 1 month + parquet verify")
+        console.print("  backfill-fridays  — fetch missing early candles for Friday expiries")
         return
 
     cmd = sys.argv[1].lower()
@@ -596,9 +775,12 @@ def main():
         month = sys.argv[2] if len(sys.argv) > 2 else None
         asyncio.run(cmd_test_run(month))
 
+    elif cmd == "backfill-fridays":
+        asyncio.run(cmd_backfill_fridays())
+
     else:
         console.print(f"[red]Unknown command: {cmd}[/red]")
-        console.print("Use: collect | resume | status | test-depth | spot | findings | test-run")
+        console.print("Use: collect | resume | status | test-depth | spot | findings | test-run | backfill-fridays")
         sys.exit(1)
 
 

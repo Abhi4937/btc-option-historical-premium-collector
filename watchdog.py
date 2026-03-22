@@ -213,9 +213,11 @@ def run_check(prev_state: dict) -> tuple[dict, str, str]:
     now = datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
     issues = []
 
-    # 1. Collector process
+    # 1. Collector process — only alert if there are pending months to collect
+    manifest = get_manifest_summary()
+    pending_m = manifest.get("pending", 0) + manifest.get("in_progress", 0)
     running = check_collector_running()
-    if running is False:
+    if running is False and pending_m > 0:
         issues.append("COLLECTOR PROCESS NOT RUNNING")
 
     # 2. DB health
@@ -233,7 +235,7 @@ def run_check(prev_state: dict) -> tuple[dict, str, str]:
         issues.append("collector.log MISSING")
     if log_data.get("disk_io", 0) > 0:
         issues.append(f"DISK I/O ERRORS in log: {log_data['disk_io']} occurrences")
-    if log_data.get("rate_429", 0) > 10:
+    if log_data.get("rate_429", 0) > 10 and pending_m > 0:
         issues.append(f"RATE LIMIT: {log_data['rate_429']} x 429 in last {LOG_SCAN_LINES} lines")
 
     # 5. Disk space
@@ -241,13 +243,11 @@ def run_check(prev_state: dict) -> tuple[dict, str, str]:
     if disk_pct is not None and disk_pct > DISK_WARN_PCT:
         issues.append(f"DISK FULL: {disk_pct:.1f}% used ({free_gb:.1f} GB free)")
 
-    # ── Manifest summary ──────────────────────────────────────────────────────
-    manifest = get_manifest_summary()
-    done_m    = manifest.get("done", 0)
-    inprog_m  = manifest.get("in_progress", 0)
-    pending_m = manifest.get("pending", 0)
-    failed_m  = manifest.get("failed", 0)
-    total_m   = done_m + inprog_m + pending_m + failed_m
+    # ── Manifest summary (already fetched above) ──────────────────────────────
+    done_m   = manifest.get("done", 0)
+    inprog_m = manifest.get("in_progress", 0)
+    failed_m = manifest.get("failed", 0)
+    total_m  = done_m + inprog_m + pending_m + failed_m
 
     # ── Build detailed report ─────────────────────────────────────────────────
     sep = "-" * 60
@@ -255,7 +255,7 @@ def run_check(prev_state: dict) -> tuple[dict, str, str]:
         sep,
         f"WATCHDOG REPORT — {now}",
         sep,
-        f"Collector : {'RUNNING ✓' if running else 'STOPPED ✗' if running is False else 'UNKNOWN'}",
+        f"Collector : {'RUNNING ✓' if running else 'COMPLETE ✓' if pending_m == 0 else 'STOPPED ✗'}",
         f"Manifest  : {done_m}/{total_m} done | {inprog_m} active | {pending_m} pending | {failed_m} failed",
         f"Disk      : {f'{disk_pct:.1f}% used, {free_gb:.1f} GB free' if disk_pct else 'N/A'}",
         "",

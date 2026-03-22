@@ -116,12 +116,18 @@ class AccountWorker:
         year  = int(month_key[:4])
         month = int(month_key[5:7])
 
-        # Date range: first_appearance of earliest expiry in this month
-        # to the last expiry of this month (end of month)
-        # Earliest expiry can appear up to 9 days before month start
-        range_start = make_ist(year, month, 1, 0, 0) - timedelta(days=10)
-        range_end   = make_ist(year, month, 1, 0, 0)
-        # Move to end of month
+        now         = now_ist()
+        month_start = make_ist(year, month, 1, 0, 0)
+
+        # For future months (April, May…) we need spot data going back up to 70 days
+        # so that strike unions can be built from the date each expiry first appeared
+        # in the live ladder (which may be weeks before the calendar month starts).
+        if month_start > now:
+            range_start = now - timedelta(days=70)
+        else:
+            range_start = month_start - timedelta(days=10)
+
+        # End of month (calendar boundary)
         if month == 12:
             range_end = make_ist(year + 1, 1, 1, 0, 0) - timedelta(seconds=1)
         else:
@@ -144,10 +150,19 @@ class AccountWorker:
             if c.get("mark_close") is not None:
                 mark_by_unix[c["timestamp_unix"]] = c["mark_close"]
 
-        # Step 2: build strike unions for ALL expiries first, then fetch all in parallel
+        # Collection rules:
+        #   Expired (e <= now)   → every daily expiry, from first_appearance → settlement
+        #   Live (e > now)       → Fridays only, for the next 3 months,
+        #                          from first_appearance → now (candles available so far)
+        three_months_ahead = (now + timedelta(days=92)).date()
+
         expiry_dts = [
             e for e in all_expiry_dates_in_month(year, month)
-            if e <= now_ist()
+            if e <= now                                          # all historical dailies
+            or (e.date() > now.date()                           # future: Fridays only
+                and e.weekday() == 4
+                and e.date() <= three_months_ahead
+                and first_appearance(e) <= now)                 # data exists from today or earlier
         ]
 
         # Build strike unions for all expiries in memory, then fetch all in parallel
@@ -173,11 +188,12 @@ class AccountWorker:
         Fetch spot (MARK:BTCUSD, BTCUSD, OI:BTCUSD) if not already done.
         Returns list of merged spot dicts for downstream ATM computation.
         """
+        import pyarrow.parquet as pq, os as _os
+
         if await is_spot_done(month_key):
             log.debug("[%s] Spot already done for %s", self.account_name, month_key)
             # Read from parquet and return as dicts
-            import pyarrow.parquet as pq, os
-            if os.path.exists(SPOT_PARQUET):
+            if _os.path.exists(SPOT_PARQUET):
                 t = pq.read_table(SPOT_PARQUET,
                                   filters=[
                                       ("timestamp_unix", ">=", ist_to_unix(start_dt)),
@@ -186,8 +202,31 @@ class AccountWorker:
                 return t.to_pylist()
             return []
 
+        now_spot = now_ist()
+
+        # For months that start entirely in the future (April, May…) the API returns
+        # nothing useful — read the existing spot parquet instead so we can build
+        # strike unions for live contracts like April 24 or May 29.
+        # Current/past months (e.g. March 2026) go through the normal API fetch path
+        # so they pick up the latest candles up to today.
+        year_k, month_k = int(month_key[:4]), int(month_key[5:7])
+        month_start_dt  = make_ist(year_k, month_k, 1)
+
+        if month_start_dt > now_spot and _os.path.exists(SPOT_PARQUET):
+            t = pq.read_table(SPOT_PARQUET,
+                               filters=[
+                                   ("timestamp_unix", ">=", ist_to_unix(start_dt)),
+                                   ("timestamp_unix", "<=", ist_to_unix(now_spot)),
+                               ])
+            if len(t) > 0:
+                log.info("[%s] Month %s: using %d spot rows from existing parquet "
+                         "(month extends to future — skipping API re-fetch)",
+                         self.account_name, month_key, len(t))
+                await mark_spot_done(month_key, len(t))
+                return t.to_pylist()
+
         start_unix = ist_to_unix(start_dt)
-        end_unix   = ist_to_unix(end_dt)
+        end_unix   = ist_to_unix(min(end_dt, now_spot))  # never request future timestamps
 
         log.info("[%s] Fetching spot data %s → %s",
                  self.account_name, format_ist(start_dt), format_ist(end_dt))
@@ -336,9 +375,10 @@ class AccountWorker:
                 return
 
             # Merge and write
-            table = merge_option_data(mark_c, oi_c)
-            path  = append_or_create_option(table, expiry_date_str, strike, opt_type)
-            await mark_symbol_done(mark_sym, len(table), path)
+            table            = merge_option_data(mark_c, oi_c)
+            path             = append_or_create_option(table, expiry_date_str, strike, opt_type)
+            earliest_unix    = table.column("timestamp_unix")[0].as_py() if len(table) > 0 else None
+            await mark_symbol_done(mark_sym, len(table), path, earliest_unix)
             self._strikes_fetched += 1
 
         except Exception as e:

@@ -51,17 +51,18 @@ log = logging.getLogger(__name__)
 
 CREATE_SYMBOLS_SQL = """
 CREATE TABLE IF NOT EXISTS symbols (
-    symbol          TEXT    PRIMARY KEY,
-    expiry_date     TEXT    NOT NULL,
-    strike          INTEGER NOT NULL,
-    option_type     TEXT    NOT NULL,   -- 'CE' or 'PE'
-    from_time_ist   TEXT    NOT NULL,
-    to_time_ist     TEXT    NOT NULL,
-    total_candles   INTEGER DEFAULT 0,
-    fetched_at      TEXT,
-    claimed_by      TEXT,
-    parquet_path    TEXT,
-    status          TEXT    NOT NULL DEFAULT 'pending'
+    symbol            TEXT    PRIMARY KEY,
+    expiry_date       TEXT    NOT NULL,
+    strike            INTEGER NOT NULL,
+    option_type       TEXT    NOT NULL,   -- 'CE' or 'PE'
+    from_time_ist     TEXT    NOT NULL,
+    to_time_ist       TEXT    NOT NULL,
+    total_candles     INTEGER DEFAULT 0,
+    fetched_at        TEXT,
+    claimed_by        TEXT,
+    parquet_path      TEXT,
+    fetched_from_unix INTEGER,            -- actual earliest candle unix timestamp stored
+    status            TEXT    NOT NULL DEFAULT 'pending'
 )
 """
 
@@ -93,6 +94,11 @@ async def init_registry():
         await db.execute(CREATE_SPOT_PROGRESS_SQL)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_sym_expiry ON symbols (expiry_date)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_sym_status ON symbols (status)")
+        # Migration: add fetched_from_unix if it doesn't exist (existing DBs)
+        try:
+            await db.execute("ALTER TABLE symbols ADD COLUMN fetched_from_unix INTEGER")
+        except Exception:
+            pass  # column already exists
         await db.commit()
     log.info("Registry initialized: %s", REGISTRY_DB)
 
@@ -116,13 +122,24 @@ async def register_symbols_batch(rows: list[tuple]):
         await db.commit()
 
 
-async def mark_symbol_done(symbol: str, total_candles: int, parquet_path: str):
+async def mark_symbol_done(symbol: str, total_candles: int, parquet_path: str,
+                           fetched_from_unix: int | None = None):
     async with _db(write=True) as db:
         await db.execute("""
             UPDATE symbols
-            SET status='done', total_candles=?, parquet_path=?, fetched_at=?
+            SET status='done', total_candles=?, parquet_path=?, fetched_at=?, fetched_from_unix=?
             WHERE symbol=?
-        """, (total_candles, parquet_path, format_ist(now_ist()), symbol))
+        """, (total_candles, parquet_path, format_ist(now_ist()), fetched_from_unix, symbol))
+        await db.commit()
+
+
+async def update_fetched_from_unix(symbol: str, fetched_from_unix: int):
+    """Update the earliest stored candle timestamp for a symbol."""
+    async with _db(write=True) as db:
+        await db.execute(
+            "UPDATE symbols SET fetched_from_unix=? WHERE symbol=?",
+            (fetched_from_unix, symbol)
+        )
         await db.commit()
 
 

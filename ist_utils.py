@@ -36,21 +36,27 @@ def get_expiry_dt(d: date) -> datetime:
     return make_ist(d.year, d.month, d.day, 17, 30)
 
 
+def _last_friday_of_month(year: int, month: int) -> date:
+    """Returns the last Friday of the given month as a date object."""
+    from calendar import monthrange
+    _, last_day = monthrange(year, month)
+    d = date(year, month, last_day)
+    days_back = (d.weekday() - 4) % 7   # weekday 4 = Friday
+    return d - timedelta(days=days_back)
+
+
 def get_expiry_ladder(from_dt: datetime) -> list[datetime]:
     """
-    Returns list of 4 expiry datetimes from given IST datetime.
+    Returns list of up to 8 expiry datetimes from given IST datetime.
     Each expiry is at 17:30:00 IST.
 
     Verified against live exchange on 2026-03-09:
       Live expiries: [Mar 10, 11, 12, 13, 20, 27, Apr 24, May 29]
-      Monday 10am ladder: [Mar 10, 11, 12, 13] — all 4 confirmed ✅
 
-    Rules:
-      current   = today 17:30 if from_dt < today 17:30 else tomorrow 17:30
-      next      = current + 1 day
-      next_next = current + 2 days
-      weekly    = nearest Friday >= next_next
-                  BUT if next_next IS Friday, jump to FOLLOWING Friday
+    Slots:
+      1-3: current, next, next-next  (daily)
+      4-6: weekly1, weekly2, weekly3 (next 3 Fridays)
+      7-8: monthly1, monthly2        (last Friday of next 2 calendar months)
     """
     today_1730 = from_dt.replace(hour=17, minute=30, second=0, microsecond=0)
 
@@ -58,13 +64,43 @@ def get_expiry_ladder(from_dt: datetime) -> list[datetime]:
     nxt      = current + timedelta(days=1)
     nxt_nxt  = current + timedelta(days=2)
 
-    # Nearest Friday >= nxt_nxt; if nxt_nxt IS Friday, jump +7
+    # 1st weekly Friday (skip if nxt_nxt is already Friday)
     days_to_fri = (4 - nxt_nxt.weekday()) % 7
-    if nxt_nxt.weekday() == 4:          # nxt_nxt is a Friday → skip it
+    if nxt_nxt.weekday() == 4:
         days_to_fri = 7
-    weekly = nxt_nxt + timedelta(days=days_to_fri)
+    weekly1 = nxt_nxt + timedelta(days=days_to_fri)
+    weekly2 = weekly1 + timedelta(days=7)
+    weekly3 = weekly1 + timedelta(days=14)
 
-    return [current, nxt, nxt_nxt, weekly]
+    # Monthly slots: last Friday of successive calendar months.
+    # If weekly3 IS already the last Friday of its month, start from the next month.
+    lf_w3_month = _last_friday_of_month(weekly3.year, weekly3.month)
+    if weekly3.date() == lf_w3_month:
+        m1_year, m1_month = weekly3.year, weekly3.month + 1
+    else:
+        m1_year, m1_month = weekly3.year, weekly3.month
+    if m1_month > 12:
+        m1_year += 1
+        m1_month -= 12
+    lf1 = _last_friday_of_month(m1_year, m1_month)
+
+    m2_year, m2_month = m1_year, m1_month + 1
+    if m2_month > 12:
+        m2_year += 1
+        m2_month -= 12
+    lf2 = _last_friday_of_month(m2_year, m2_month)
+
+    monthly1 = make_ist(lf1.year, lf1.month, lf1.day, 17, 30)
+    monthly2 = make_ist(lf2.year, lf2.month, lf2.day, 17, 30)
+
+    # Deduplicate by date (some slots may coincide, e.g. weekly3 == monthly)
+    seen: set[date] = set()
+    ladder: list[datetime] = []
+    for dt in [current, nxt, nxt_nxt, weekly1, weekly2, weekly3, monthly1, monthly2]:
+        if dt.date() not in seen:
+            seen.add(dt.date())
+            ladder.append(dt)
+    return ladder
 
 
 def first_appearance(expiry_dt: datetime) -> datetime:
@@ -72,11 +108,10 @@ def first_appearance(expiry_dt: datetime) -> datetime:
     Returns the earliest IST datetime (00:00) on which `expiry_dt`
     first appears in the expiry ladder.
 
-    For non-Friday expiries: at most 2 days before (next-next slot).
-    For Friday expiries (weekly): can appear up to 9 days before.
-    We probe backwards up to 10 days.
+    Probe window extended to 70 days to cover monthly2 slot
+    (~60 days before settlement for next-to-next monthly expiries).
     """
-    probe_start = expiry_dt - timedelta(days=10)
+    probe_start = expiry_dt - timedelta(days=70)
     result = expiry_dt - timedelta(days=2)      # conservative default
 
     check = probe_start.replace(hour=9, minute=0, second=0, microsecond=0)

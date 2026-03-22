@@ -46,12 +46,12 @@ MAX_CANDLES_PER_CALL = 2000
 # Test 7: NO rate-limit headers present — must count-limit proactively.
 # Official docs: 10,000 units per 5-min window, OHLC = 3 units per call.
 # => 10,000 / 3 = 3,333 real calls per 5-min window TOTAL (per-IP, shared across accounts).
-# With 5 accounts on same IP: 3,333 / 5 = ~666 per account.
+# With 1 account on same IP: 3,333 / 1 = 3,333 per account.
 RATE_LIMIT_CALLS_PER_WINDOW = 3_333
 RATE_LIMIT_WINDOW_SECONDS   = 300       # 5-minute fixed window
 
-# Per-account safe limit: 90% of (global limit / num accounts) = 3,333 * 0.90 / 5 = ~600
-RATE_LIMIT_SAFE_CALLS = 600
+# Conservative cap for 1 active account to avoid observed 429s.
+RATE_LIMIT_SAFE_CALLS = 2000
 
 # Sleep buffer on 429 (if we do hit it despite proactive limiting)
 RATE_LIMIT_429_BUFFER_MS = 500
@@ -74,8 +74,8 @@ PARQUET_ROW_GROUP_SIZE    = 10_000
 
 # ── Parallelism ───────────────────────────────────────────────────────────────
 # Test 10: per-account independent rate limits confirmed.
-# 5 accounts × 3,333 = ~16,665 calls/5-min window combined.
-ACTIVE_ACCOUNTS = 5
+# 1 account active for the current run.
+ACTIVE_ACCOUNTS = 1
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

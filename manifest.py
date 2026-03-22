@@ -146,6 +146,24 @@ async def reset_stale_in_progress():
         return cur.rowcount
 
 
+async def reset_future_months(today) -> int:
+    """
+    Reset done future months (expiry_month > today's YYYY-MM) back to pending.
+    Called at the start of every run so newly-available Friday expiries
+    (whose first_appearance just passed) are re-checked without manual intervention.
+    today: a date object.
+    """
+    today_key = f"{today.year:04d}-{today.month:02d}"
+    async with _db() as db:
+        cur = await db.execute(
+            "UPDATE manifest SET status='pending', claimed_by=NULL "
+            "WHERE expiry_month > ? AND status='done'",
+            (today_key,)
+        )
+        await db.commit()
+        return cur.rowcount
+
+
 async def get_manifest_summary() -> list[dict]:
     async with _db() as db:
         async with db.execute(

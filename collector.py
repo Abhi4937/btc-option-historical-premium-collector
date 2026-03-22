@@ -16,7 +16,7 @@ from config import (
     COLLECTION_START_DATE, MANIFEST_DB, REGISTRY_DB,
     SPOT_DIR, OPTIONS_DIR, DB_DIR, LOGS_DIR,
 )
-from manifest import init_manifest, populate_manifest, reset_stale_in_progress
+from manifest import init_manifest, populate_manifest, reset_stale_in_progress, reset_future_months
 from registry import init_registry, reset_stale_in_progress as reset_registry_stale
 from worker import AccountWorker
 from ist_utils import now_ist
@@ -64,10 +64,22 @@ async def run_collection(
 
     # Determine date range
     start = COLLECTION_START_DATE
-    end   = now_ist().date()
+    now   = now_ist()
+    end   = now.date()
 
-    # Populate manifest with all months
-    await populate_manifest(start.year, start.month, end.year, end.month)
+    # Extend manifest 3 months ahead to cover all weekly Friday expiries that are
+    # currently live and being collected.
+    from datetime import timedelta
+    end_3m = (now + timedelta(days=92)).date()
+
+    await populate_manifest(start.year, start.month, end_3m.year, end_3m.month)
+
+    # Reset any future months (> today) that were previously marked done back to
+    # pending so newly-available Fridays (whose first_appearance just passed) get
+    # picked up without manual intervention.
+    reset_n = await reset_future_months(end)
+    if reset_n:
+        log.info("Reset %d future month(s) to pending for new Friday re-check", reset_n)
 
     if resume:
         stale_m = await reset_stale_in_progress()

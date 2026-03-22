@@ -6,6 +6,7 @@ Run every 15 minutes via cron or manually.
 import sqlite3
 import os
 import sys
+import json
 import requests
 from datetime import datetime, timezone, timedelta
 
@@ -19,13 +20,18 @@ BOT_TOKEN = "8675658345:AAEn9yIj3uZdu3TkPnXY2P1ubHgGMQc4COk"
 CHAT_ID   = "1088952172"
 
 
+def connect_readonly(path: str) -> sqlite3.Connection:
+    # Monitor queries only; immutable avoids journal/lock writes on shared DB files.
+    return sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+
+
 def send(msg: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"})
 
 
 def get_manifest():
-    db = sqlite3.connect(MANIFEST_DB)
+    db = connect_readonly(MANIFEST_DB)
     rows = db.execute("SELECT status, COUNT(*) FROM manifest GROUP BY status").fetchall()
     in_prog = db.execute(
         "SELECT expiry_month, claimed_by FROM manifest WHERE status='in_progress' ORDER BY expiry_month"
@@ -38,7 +44,7 @@ def get_manifest():
 
 
 def get_registry():
-    db = sqlite3.connect(REGISTRY_DB)
+    db = connect_readonly(REGISTRY_DB)
     rows = db.execute("SELECT status, COUNT(*), SUM(total_candles) FROM symbols GROUP BY status").fetchall()
     spot = db.execute("SELECT COUNT(*) FROM spot_progress WHERE status='done'").fetchone()[0]
     db.close()
@@ -47,8 +53,8 @@ def get_registry():
 
 def get_month_breakdown():
     import calendar
-    reg = sqlite3.connect(REGISTRY_DB)
-    man = sqlite3.connect(MANIFEST_DB)
+    reg = connect_readonly(REGISTRY_DB)
+    man = connect_readonly(MANIFEST_DB)
 
     months = man.execute(
         "SELECT expiry_month, status, claimed_by FROM manifest ORDER BY expiry_month"
@@ -82,8 +88,8 @@ def get_active_worker_stats():
     Returns list of dicts.
     """
     options_dir = OPTIONS_DIR
-    reg = sqlite3.connect(REGISTRY_DB)
-    man = sqlite3.connect(MANIFEST_DB)
+    reg = connect_readonly(REGISTRY_DB)
+    man = connect_readonly(MANIFEST_DB)
 
     months = man.execute(
         "SELECT expiry_month, claimed_by FROM manifest WHERE status='in_progress' ORDER BY expiry_month"
@@ -154,9 +160,23 @@ def get_recent_errors():
     with open(log_path, "r") as f:
         lines = f.readlines()
     for line in lines[-500:]:
+        if "[httpx]" in line:          # skip httpx request/response noise
+            continue
         if "ERROR" in line or "FAILED" in line or "429" in line:
             errors.append(line.strip())
     return errors[-5:]  # last 5 errors
+
+
+def get_backfill_progress():
+    """Read backfill progress state file if it exists."""
+    path = os.path.join(LOGS_DIR, "backfill_progress.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def main():
@@ -168,6 +188,7 @@ def main():
     errors = get_recent_errors()
     month_rows = get_month_breakdown()
     active_stats = get_active_worker_stats()
+    backfill = get_backfill_progress()
 
     done_m    = manifest.get("done", 0)
     inprog_m  = manifest.get("in_progress", 0)
@@ -188,29 +209,63 @@ def main():
         "<b>Overall: {done_m}/{total_m} months done</b>".format(done_m=done_m, total_m=total_m),
         f"  In Progress: {inprog_m}  |  Pending: {pending_m}  |  Failed: {failed_m}",
         "",
-        "<b>Symbols</b>",
-        f"  Done: {sym_done:,}  |  Empty: {sym_empty+sym_nl:,}  |  Pending: {sym_pending:,}  |  Failed: {sym_fail}",
-        f"  Total candles: {total_candles:,}",
-        "",
-        "<b>Spot</b>",
-        f"  Months: {spot_done}  |  Parquet: {f'{spot_mb:.1f} MB' if spot_mb else 'missing'}",
-        "",
-        "<b>Month Breakdown</b>",
-        "<code>Month    Exp    Done   Empty  Pend    Pct</code>",
     ]
 
-    for month, mstatus, claimed_by, expiries, expected, done, empty, pending, pct in month_rows:
-        if mstatus == "pending":
-            continue
-        if mstatus == "done":
-            check = "✓" if pending == 0 and expiries == expected else f"⚠{expiries}/{expected}"
-            label = f"done {check}"
-        else:
-            owner = f"({claimed_by})" if claimed_by else ""
-            label = f"active {owner}"
-        lines.append(
-            f"<code>{month}  {expiries:2}/{expected:<2}  {done:5}  {empty:5}  {pending:5}  {pct:5.1f}%  {label}</code>"
-        )
+    if backfill:
+        status    = backfill.get("status", "unknown")
+        done_exp  = backfill.get("done_expiries", 0)
+        total_exp = backfill.get("total_expiries", 0)
+        done_sym  = backfill.get("done_symbols", 0)
+        total_sym = backfill.get("total_symbols", 0)
+        no_data   = backfill.get("no_data_symbols", 0)
+        err_sym   = backfill.get("error_symbols", 0)
+        current   = backfill.get("current_expiry", "—")
+        updated   = backfill.get("last_updated", "—")
+        pct       = done_exp / total_exp * 100 if total_exp else 0
+        icon      = "✅" if status == "complete" else "⏳"
+        lines += [
+            f"<b>{icon} Backfill ({status})</b>",
+            f"  Expiries : {done_exp}/{total_exp}  ({pct:.1f}%)",
+            f"  Symbols  : {done_sym:,} updated  |  {no_data} no-data  |  {err_sym} errors",
+        ]
+        if status == "running":
+            lines.append(f"  Current  : {current}")
+        lines.append(f"  Updated  : {updated}")
+        lines.append("")
+
+    # Show symbols/spot/month breakdown only when collection is active
+    active_months = [r for r in month_rows if r[1] != "done" and r[1] != "pending"]
+    if inprog_m > 0 or pending_m > 0:
+        lines += [
+            "",
+            "<b>Symbols</b>",
+            f"  Done: {sym_done:,}  |  Empty: {sym_empty+sym_nl:,}  |  Pending: {sym_pending:,}  |  Failed: {sym_fail}",
+            f"  Total candles: {total_candles:,}",
+            "",
+            "<b>Spot</b>",
+            f"  Months: {spot_done}  |  Parquet: {f'{spot_mb:.1f} MB' if spot_mb else 'missing'}",
+            "",
+            "<b>Month Breakdown</b>",
+            "<code>Month    Exp    Done   Empty  Pend    Pct</code>",
+        ]
+        for month, mstatus, claimed_by, expiries, expected, done, empty, pending, pct in month_rows:
+            if mstatus == "pending":
+                continue
+            if mstatus == "done":
+                check = "✓" if pending == 0 and expiries == expected else f"⚠{expiries}/{expected}"
+                label = f"done {check}"
+            else:
+                owner = f"({claimed_by})" if claimed_by else ""
+                label = f"active {owner}"
+            lines.append(
+                f"<code>{month}  {expiries:2}/{expected:<2}  {done:5}  {empty:5}  {pending:5}  {pct:5.1f}%  {label}</code>"
+            )
+    else:
+        lines += [
+            "",
+            f"  Symbols: {sym_done:,} done  |  {sym_empty+sym_nl:,} empty  |  {total_candles:,} candles",
+            f"  Spot: {spot_done} months  |  {f'{spot_mb:.1f} MB' if spot_mb else 'missing'}",
+        ]
 
     if active_stats:
         lines.append("")
