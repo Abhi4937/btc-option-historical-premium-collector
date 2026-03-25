@@ -2,6 +2,43 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## MANDATORY: Pre-flight check after every code change
+
+Run ALL of these before saying "ready to run" — no exceptions:
+
+```bash
+# 1. Syntax
+python3 -c "
+import ast
+for f in ['worker.py','progress.py','collector.py','monitor.py','manifest.py','registry.py']:
+    ast.parse(open(f).read()); print(f'OK: {f}')
+"
+
+# 2. Imports
+python3 -c "import worker, progress, collector, monitor, manifest, registry; print('imports OK')"
+
+# 3. Stale references — grep for any renamed/deleted symbol
+grep -n "OLD_NAME" *.py
+
+# 4. Worker→Progress key alignment
+#    Keys sent in worker._update_status() must all exist in progress.py s.get()
+
+# 5. Attribute check — every self._ read in worker.py must be in __init__
+
+# 6. Dry render — catches AttributeError before user runs
+python3 -c "
+import asyncio
+from progress import ProgressDisplay
+d = ProgressDisplay()
+d._render()
+print('render OK')
+"
+```
+
+**Past failures from skipping this:**
+- `_session_calls` renamed but two stale references left → crash on resume
+- `_estimated_total_calls` removed from `__init__` but reference left in `_render()` → crash on resume
+
 ## What this project does
 
 Collects BTC options historical data (1-minute OHLC + OI candles) from Delta Exchange India (`api.india.delta.exchange`) and stores it as Parquet files on disk. Runs on WSL2. Up to 5 API accounts work in parallel, each independently claiming and processing months of data.

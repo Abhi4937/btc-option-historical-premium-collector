@@ -301,7 +301,7 @@ def run_check(prev_state: dict) -> tuple[dict, str, str]:
     report_lines.append(sep)
     detailed = "\n".join(report_lines)
 
-    # ── Telegram one-liner ────────────────────────────────────────────────────
+    # ── Telegram alert ────────────────────────────────────────────────────────
     if issues:
         short_issues = "; ".join(issues[:3])
         if len(issues) > 3:
@@ -310,7 +310,7 @@ def run_check(prev_state: dict) -> tuple[dict, str, str]:
     else:
         telegram_line = (
             f"✅ <b>Watchdog {now}</b> — All OK | "
-            f"{done_m}/{total_m} months done | "
+            f"{done_m}/{total_m} months | "
             f"{inprog_m} active | "
             f"disk {f'{disk_pct:.1f}%' if disk_pct else 'N/A'}"
         )
@@ -347,7 +347,17 @@ def main():
         sys.stdout.flush()
 
         save_state(new_state)
-        send(tg_line)
+
+        # Send full progress report via monitor.py every cycle
+        try:
+            monitor_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.py")
+            subprocess.run([sys.executable, monitor_script], capture_output=True, timeout=30)
+        except Exception as e:
+            print(f"[watchdog] monitor.py send failed: {e}")
+
+        # Send alert only when there are issues
+        if tg_line:
+            send(tg_line)
 
         time.sleep(CHECK_INTERVAL)
 

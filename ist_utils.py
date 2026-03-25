@@ -108,13 +108,19 @@ def first_appearance(expiry_dt: datetime) -> datetime:
     Returns the earliest IST datetime (00:00) on which `expiry_dt`
     first appears in the expiry ladder.
 
+    Probes at 17:31 IST each day (just after the 17:30 settlement), so
+    newly-listed contracts that appear at settlement are caught the same day
+    rather than the morning after. This prevents a ~6.5h gap for daily
+    expiries (Sat/Sun in particular) whose contracts start at 17:30 the
+    previous day.
+
     Probe window extended to 70 days to cover monthly2 slot
     (~60 days before settlement for next-to-next monthly expiries).
     """
     probe_start = expiry_dt - timedelta(days=70)
     result = expiry_dt - timedelta(days=2)      # conservative default
 
-    check = probe_start.replace(hour=9, minute=0, second=0, microsecond=0)
+    check = probe_start.replace(hour=17, minute=31, second=0, microsecond=0)
     while check.date() < expiry_dt.date():
         ladder = get_expiry_ladder(check)
         if any(e.date() == expiry_dt.date() for e in ladder):

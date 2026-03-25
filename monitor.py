@@ -179,6 +179,18 @@ def get_backfill_progress():
         return None
 
 
+def get_session_start():
+    """Read session start snapshot saved at run/resume time."""
+    path = os.path.join(LOGS_DIR, "session_start.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def main():
     now = datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
 
@@ -189,6 +201,7 @@ def main():
     month_rows = get_month_breakdown()
     active_stats = get_active_worker_stats()
     backfill = get_backfill_progress()
+    session = get_session_start()
 
     done_m    = manifest.get("done", 0)
     inprog_m  = manifest.get("in_progress", 0)
@@ -203,57 +216,72 @@ def main():
     sym_fail    = registry.get("failed", {}).get("count", 0)
     total_candles = sum(v["candles"] for v in registry.values())
 
+    # ── Call-based session progress ───────────────────────────────────────────
+    if session:
+        init_pending = session.get("pending_symbols", 0) or 1
+        syms_done    = max(0, init_pending - sym_pending)
+        syms_pct     = min(syms_done / init_pending * 100, 100.0)
+        bar_w        = 20
+        filled       = int(bar_w * syms_pct / 100)
+        bar          = "█" * filled + "░" * (bar_w - filled)
+        session_line = (
+            f"  Symbols: {syms_done:,}/{init_pending:,} "
+            f"[{bar}] {syms_pct:.1f}%"
+            f"  (started {session.get('started_at', '?')})"
+        )
+    else:
+        session_line = None
+
     lines = [
-        f"<b>BTC Collector Health — {now}</b>",
-        "",
-        "<b>Overall: {done_m}/{total_m} months done</b>".format(done_m=done_m, total_m=total_m),
-        f"  In Progress: {inprog_m}  |  Pending: {pending_m}  |  Failed: {failed_m}",
+        f"<b>BTC Collector — {now}</b>",
+    ]
+    if session_line:
+        lines.append(session_line)
+    if inprog_m > 0 or pending_m > 0:
+        lines.append(f"  Active: {inprog_m}  |  Pending: {pending_m}  |  Symbols left: {sym_pending:,}  |  Failed: {failed_m}")
+    else:
+        lines.append(f"  Collection complete ✅  |  Failed: {failed_m}")
+    lines += [
+        f"  Spot: {f'{spot_mb:.1f} MB' if spot_mb else 'missing'}  |  Candles: {total_candles:,}",
         "",
     ]
 
-    if backfill:
-        status    = backfill.get("status", "unknown")
+    # Backfill: only show if currently running
+    if backfill and backfill.get("status") == "running":
         done_exp  = backfill.get("done_expiries", 0)
         total_exp = backfill.get("total_expiries", 0)
         done_sym  = backfill.get("done_symbols", 0)
-        total_sym = backfill.get("total_symbols", 0)
         no_data   = backfill.get("no_data_symbols", 0)
-        err_sym   = backfill.get("error_symbols", 0)
         current   = backfill.get("current_expiry", "—")
-        updated   = backfill.get("last_updated", "—")
         pct       = done_exp / total_exp * 100 if total_exp else 0
-        icon      = "✅" if status == "complete" else "⏳"
         lines += [
-            f"<b>{icon} Backfill ({status})</b>",
-            f"  Expiries : {done_exp}/{total_exp}  ({pct:.1f}%)",
-            f"  Symbols  : {done_sym:,} updated  |  {no_data} no-data  |  {err_sym} errors",
+            f"<b>⏳ Backfill running</b>",
+            f"  Expiries: {done_exp}/{total_exp} ({pct:.1f}%)  |  Current: {current}",
+            f"  Symbols: {done_sym:,} updated  |  {no_data} no-data",
+            "",
         ]
-        if status == "running":
-            lines.append(f"  Current  : {current}")
-        lines.append(f"  Updated  : {updated}")
-        lines.append("")
 
-    # Show symbols/spot/month breakdown only when collection is active
-    active_months = [r for r in month_rows if r[1] != "done" and r[1] != "pending"]
+    # Active + recent done months only (skip older history)
     if inprog_m > 0 or pending_m > 0:
         lines += [
-            "",
-            "<b>Symbols</b>",
+            "<b>Symbols (this session)</b>",
             f"  Done: {sym_done:,}  |  Empty: {sym_empty+sym_nl:,}  |  Pending: {sym_pending:,}  |  Failed: {sym_fail}",
-            f"  Total candles: {total_candles:,}",
-            "",
-            "<b>Spot</b>",
-            f"  Months: {spot_done}  |  Parquet: {f'{spot_mb:.1f} MB' if spot_mb else 'missing'}",
             "",
             "<b>Month Breakdown</b>",
             "<code>Month    Exp    Done   Empty  Pend    Pct</code>",
         ]
-        for month, mstatus, claimed_by, expiries, expected, done, empty, pending, pct in month_rows:
-            if mstatus == "pending":
-                continue
+        # Show last 3 done months + all active/pending months
+        done_rows = [r for r in month_rows if r[1] == "done"]
+        active_rows = [r for r in month_rows if r[1] not in ("done", "pending")]
+        pending_rows = [r for r in month_rows if r[1] == "pending"]
+        show_rows = done_rows[-3:] + active_rows + pending_rows[:3]
+
+        for month, mstatus, claimed_by, expiries, expected, done, empty, pending, pct in show_rows:
             if mstatus == "done":
                 check = "✓" if pending == 0 and expiries == expected else f"⚠{expiries}/{expected}"
                 label = f"done {check}"
+            elif mstatus == "pending":
+                label = "pending"
             else:
                 owner = f"({claimed_by})" if claimed_by else ""
                 label = f"active {owner}"
@@ -262,9 +290,7 @@ def main():
             )
     else:
         lines += [
-            "",
             f"  Symbols: {sym_done:,} done  |  {sym_empty+sym_nl:,} empty  |  {total_candles:,} candles",
-            f"  Spot: {spot_done} months  |  {f'{spot_mb:.1f} MB' if spot_mb else 'missing'}",
         ]
 
     if active_stats:

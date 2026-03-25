@@ -17,7 +17,7 @@ from rich.progress import (
 )
 from rich import box
 
-from config import ACCOUNT_NAMES
+from config import ACCOUNT_NAMES, ACTIVE_ACCOUNTS
 
 
 def _fmt_dur(seconds: float) -> str:
@@ -30,15 +30,17 @@ def _fmt_dur(seconds: float) -> str:
 class ProgressDisplay:
 
     def __init__(self):
-        self.console         = Console()
+        self.console               = Console()
         self._account_states: dict[str, dict] = {}
         self._manifest_counts: dict[str, int] = {}
-        self._start_time     = time.monotonic()
-        self._total_months   = 0
-        self._lock           = asyncio.Lock()
+        self._start_time           = time.monotonic()
+        self._total_months         = 0
+        self._lock                 = asyncio.Lock()
 
     def update_account(self, account_name: str, state_dict: dict):
+        existing = self._account_states.get(account_name, {})
         self._account_states[account_name] = {
+            **existing,
             **state_dict,
             "_updated": time.monotonic(),
         }
@@ -50,26 +52,34 @@ class ProgressDisplay:
     def _render(self) -> Panel:
         elapsed = time.monotonic() - self._start_time
 
-        # ── Overall progress ──────────────────────────────────────────────────
+        # ── Session symbol progress ───────────────────────────────────────────
         done    = self._manifest_counts.get("done",        0)
         pending = self._manifest_counts.get("pending",     0)
         running = self._manifest_counts.get("in_progress", 0)
         failed  = self._manifest_counts.get("failed",      0)
-        total   = self._total_months or 1
 
-        pct = done / total
+        # Both come from worker counters — always in sync, no DB lag
+        session_syms_done = sum(
+            s.get("session_symbols_done", 0) for s in self._account_states.values()
+        )
+        total_syms = max(sum(
+            s.get("session_total_symbols", 0) for s in self._account_states.values()
+        ), 1)
+        pct = min(session_syms_done / total_syms, 1.0)
+
         bar_w = 30
         filled = int(bar_w * pct)
         bar = "█" * filled + "░" * (bar_w - filled)
 
-        if done > 0 and pct < 1.0:
+        if session_syms_done > 0 and pct < 1.0:
             eta_s = elapsed / pct * (1 - pct)
             eta   = _fmt_dur(eta_s)
         else:
             eta = "--:--:--"
 
+        total_str = f"{total_syms:,}" if total_syms > 1 else "?"
         header = (
-            f"Overall: [bold green]{done}[/bold green]/{total} months "
+            f"Symbols: [bold green]{session_syms_done:,}[/bold green]/{total_str} "
             f"[{bar}] [cyan]{pct*100:.1f}%[/cyan] | "
             f"Elapsed: [yellow]{_fmt_dur(elapsed)}[/yellow] | "
             f"ETA: [magenta]{eta}[/magenta]"
@@ -79,19 +89,23 @@ class ProgressDisplay:
 
         # ── Per-account table ─────────────────────────────────────────────────
         tbl = Table(box=box.SIMPLE_HEAD, show_header=True, expand=True)
-        tbl.add_column("Account",  style="bold cyan", width=14)
-        tbl.add_column("Month",    width=10)
-        tbl.add_column("State",    width=18)
-        tbl.add_column("Calls",    width=8,  justify="right")
-        tbl.add_column("Symbol",   width=36, overflow="ellipsis")
+        tbl.add_column("Account",   style="bold cyan", width=14)
+        tbl.add_column("Month",     width=10)
+        tbl.add_column("Expiry",    width=12)
+        tbl.add_column("Exp#",      width=6,  justify="right")
+        tbl.add_column("State",     width=18)
+        tbl.add_column("Calls",     width=8,  justify="right")
+        tbl.add_column("Symbols",   width=12, justify="right")
 
-        for name in ACCOUNT_NAMES:
+        for name in ACCOUNT_NAMES[:ACTIVE_ACCOUNTS]:
             s = self._account_states.get(name, {})
-            state   = s.get("state",   "waiting")
-            month   = s.get("month",   "—")
-            calls   = s.get("calls",   0)
-            symbol  = s.get("symbol",  "")
-            error   = s.get("error",   "")
+            state    = s.get("state",    "waiting")
+            month    = s.get("month",    "—")
+            expiry   = s.get("expiry",   "")
+            expiries = s.get("expiries", "")
+            calls    = s.get("calls",    0)
+            strikes  = s.get("strikes",  "")
+            error    = s.get("error",    "")
 
             if state == "done":
                 state_str = "[green]done ✅[/green]"
@@ -109,9 +123,11 @@ class ProgressDisplay:
             tbl.add_row(
                 name,
                 str(month) if month else "—",
+                expiry or "—",
+                expiries or "—",
                 state_str,
                 str(calls),
-                symbol[:36] if symbol else (f"[red]{error[:36]}[/red]" if error else ""),
+                strikes if strikes else (f"[red]{error[:12]}[/red]" if error else ""),
             )
 
         from rich.columns import Columns
@@ -130,6 +146,7 @@ class ProgressDisplay:
         Periodically polls manifest for overall counts.
         """
         from manifest import get_progress_counts
+
 
         async def poll_manifest():
             while True:

@@ -86,6 +86,19 @@ async def run_collection(
         stale_r = await reset_registry_stale()
         log.info("Resume: reset %d manifest months + %d registry symbols", stale_m, stale_r)
 
+    # Snapshot pending symbol count for call-based progress in monitor/watchdog
+    import json as _json
+    from registry import get_stats as _get_stats
+    _stats = await _get_stats()
+    _pending_syms = _stats.get("pending", {}).get("count", 0)
+    _session_file = os.path.join(LOGS_DIR, "session_start.json")
+    with open(_session_file, "w") as _f:
+        _json.dump({
+            "started_at":      now_ist().strftime("%Y-%m-%d %H:%M IST"),
+            "pending_symbols": _pending_syms,
+        }, _f)
+    log.info("Session start: %d pending symbols → %d estimated calls", _pending_syms, _pending_syms * 2)
+
     accounts = _load_accounts()
     if not accounts:
         raise RuntimeError("No API accounts configured in .env")

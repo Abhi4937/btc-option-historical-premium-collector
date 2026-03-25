@@ -61,13 +61,20 @@ class AccountWorker:
         status_callback(account_name, state_dict) — called on progress updates
         for the Rich UI.
         """
-        self.account_name     = account_name
-        self.api_key          = api_key
-        self.status_callback  = status_callback
-        self._current_month   = None
-        self._calls_this_month = 0
-        self._strikes_fetched  = 0
-        self._sem             = asyncio.Semaphore(50)  # max concurrent HTTP calls per account
+        self.account_name      = account_name
+        self.api_key           = api_key
+        self.status_callback   = status_callback
+        self._current_month        = None
+        self._current_expiry       = None
+        self._month_expiries_total = 0   # total expiries in current month
+        self._month_expiries_done  = 0   # expiries fully completed
+        self._month_symbols_total  = 0   # total CE+PE symbols in current month
+        self._month_symbols_done   = 0   # symbols completed (done/empty/skipped)
+        self._calls_this_month     = 0
+        self._session_symbols_done = 0   # cumulative symbols done this session
+        self._session_total_symbols= 0   # cumulative total symbols across all months this session
+        self._strikes_fetched      = 0
+        self._sem                  = asyncio.Semaphore(50)  # max concurrent HTTP calls per account
 
     def _update_status(self, **kwargs):
         if self.status_callback:
@@ -78,8 +85,6 @@ class AccountWorker:
         log.info("[%s] Worker started", self.account_name)
         def _on_call():
             self._calls_this_month += 1
-            self._update_status(state="fetching", month=self._current_month,
-                                calls=self._calls_this_month)
         async with DeltaAPIClient(self.account_name, self.api_key, on_call=_on_call) as client:
             while True:
                 month_key = await claim_next_month(self.account_name)
@@ -151,31 +156,48 @@ class AccountWorker:
                 mark_by_unix[c["timestamp_unix"]] = c["mark_close"]
 
         # Collection rules:
-        #   Expired (e <= now)   → every daily expiry, from first_appearance → settlement
-        #   Live (e > now)       → Fridays only, for the next 3 months,
-        #                          from first_appearance → now (candles available so far)
+        #   Expired (e <= now)        → every daily expiry, from first_appearance → settlement
+        #   Near-term (today + 2d)    → today, tomorrow, day after (live daily ladder)
+        #   Future Fridays            → weekly + monthly expiries within 3 months where
+        #                               first_appearance(e) <= now
         three_months_ahead = (now + timedelta(days=92)).date()
+        near_term_cutoff   = (now + timedelta(days=2)).date()
 
         expiry_dts = [
             e for e in all_expiry_dates_in_month(year, month)
             if e <= now                                          # all historical dailies
-            or (e.date() > now.date()                           # future: Fridays only
+            or (e.date() <= near_term_cutoff                    # today + next 2 days (live dailies)
+                and first_appearance(e) <= now)
+            or (e.date() > near_term_cutoff                     # future: Fridays only
                 and e.weekday() == 4
                 and e.date() <= three_months_ahead
-                and first_appearance(e) <= now)                 # data exists from today or earlier
+                and first_appearance(e) <= now)
         ]
 
-        # Build strike unions for all expiries in memory, then fetch all in parallel
+        # Build all strike unions first (fast, in-memory) so we know totals upfront
         expiry_strikes: dict[str, dict[int, int]] = {}
         for expiry_dt in expiry_dts:
             strikes = await self._build_strike_union(expiry_dt, first_appearance(expiry_dt), mark_by_unix)
             expiry_strikes[expiry_dt.date().isoformat()] = strikes
 
-        await asyncio.gather(*[
-            self._process_expiry(client, expiry_dt, mark_by_unix, range_start,
-                                 expiry_strikes[expiry_dt.date().isoformat()])
-            for expiry_dt in expiry_dts
-        ])
+        # Set month-level totals for progress display
+        self._month_expiries_total  = len(expiry_dts)
+        self._month_expiries_done   = 0
+        self._month_symbols_total   = sum(len(s) * 2 for s in expiry_strikes.values())
+        self._month_symbols_done    = 0
+        self._session_total_symbols += self._month_symbols_total
+        self._update_status(state="working", month=month_key,
+                            expiry="—",
+                            expiries=f"0/{self._month_expiries_total}",
+                            strikes=f"0/{self._month_symbols_total}",
+                            calls=self._calls_this_month,
+                            session_symbols_done=self._session_symbols_done,
+                            session_total_symbols=self._session_total_symbols)
+
+        # Process one expiry at a time — cleaner resume, full 50 slots per expiry
+        for expiry_dt in expiry_dts:
+            await self._process_expiry(client, expiry_dt, mark_by_unix, range_start,
+                                       expiry_strikes[expiry_dt.date().isoformat()])
 
     async def _ensure_spot_data(
         self,
@@ -269,9 +291,10 @@ class AccountWorker:
           1. Compute first_appearance
           2. Fetch each (strike, CE/PE) symbol using in-memory strikes
         """
-        expiry_date_str = expiry_dt.date().isoformat()
-        appear_dt       = first_appearance(expiry_dt)
-        expiry_unix     = ist_to_unix(expiry_dt) + SETTLEMENT_EXTRA_SECONDS
+        expiry_date_str      = expiry_dt.date().isoformat()
+        self._current_expiry = expiry_date_str
+        appear_dt            = first_appearance(expiry_dt)
+        expiry_unix          = ist_to_unix(expiry_dt) + SETTLEMENT_EXTRA_SECONDS
 
         log.info("[%s] Expiry %s: first_appearance=%s",
                  self.account_name, expiry_date_str, format_ist(appear_dt))
@@ -279,6 +302,7 @@ class AccountWorker:
         if not strikes:
             log.warning("[%s] No strikes found for expiry %s",
                         self.account_name, expiry_date_str)
+            self._month_expiries_done += 1
             return
 
         log.info("[%s] Expiry %s: %d strikes to fetch",
@@ -304,6 +328,17 @@ class AccountWorker:
                     client, opt_type, strike, expiry_dt,
                     fetch_start_unix, expiry_unix, expiry_date_str,
                 )
+                self._month_symbols_done   += 1
+                self._session_symbols_done += 1
+                self._update_status(
+                    state="fetching", month=self._current_month,
+                    expiry=self._current_expiry,
+                    expiries=f"{self._month_expiries_done}/{self._month_expiries_total}",
+                    strikes=f"{self._month_symbols_done}/{self._month_symbols_total}",
+                    calls=self._calls_this_month,
+                    session_symbols_done=self._session_symbols_done,
+                    session_total_symbols=self._session_total_symbols,
+                )
 
         tasks = [
             _fetch_with_sem(opt_type, strike)
@@ -311,6 +346,7 @@ class AccountWorker:
             for opt_type in ("CE", "PE")
         ]
         await asyncio.gather(*tasks)
+        self._month_expiries_done += 1
 
     async def _build_strike_union(
         self,
