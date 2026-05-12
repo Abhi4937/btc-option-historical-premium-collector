@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "btc-manifest": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-sqlite",
+        "--db-path",
+        "/home/abhis/btc-data/db/manifest.db"
+      ]
+    },
+    "btc-registry": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-sqlite",
+        "--db-path",
+        "/home/abhis/btc-data/db/registry.db"
+      ]
+    }
+  }
+}
