@@ -150,6 +150,54 @@ Every existing `done` symbol is checked against `min(expiry_unix, spot_last_unix
 
 Use this when you want **strict date scope** (e.g. "from 2026-04-21 to today") and need BOTH start AND tail coverage, not just tail. The standard catch-up above only handles tail; the start-gap fill needs a separate pass because the worker writes parquets starting at per-strike `first_seen`, which is later than expiry-level `first_appearance` for strikes that entered the ATM±40 band late or that were originally collected under a narrower lookback.
 
+### CRITICAL: check spot for internal gaps BEFORE resume
+
+`main.py spot` only does a tail-fetch (`last_ts → now`). It does **NOT** fill internal gaps. If a prior collection was interrupted or the collector was idle while spot continued to tick, the parquet can have mid-history holes — and `last_ts` will look current even though the middle is swiss cheese. The worker's `_build_strike_union` (worker.py:401) iterates minute-by-minute, so a 5-day spot gap means any strike BTC visited *only during* that window is missing from the union and never gets fetched. Options for known strikes will look "complete" while real strikes are silently absent.
+
+**Always do this first when re-fetching options:**
+
+```bash
+# Check for gaps
+python3 -c "
+import pyarrow.parquet as pq
+from datetime import datetime, timezone, timedelta
+from config import SPOT_PARQUET
+IST = timezone(timedelta(hours=5, minutes=30))
+ts = sorted(set(pq.read_table(SPOT_PARQUET, columns=['timestamp_unix']).column('timestamp_unix').to_pylist()))
+gaps = [(ts[i-1]+60, ts[i]-60) for i in range(1, len(ts)) if ts[i] - ts[i-1] > 90]
+print(f'rows={len(ts)} gaps>90s={len(gaps)}')
+for s, e in gaps[:5]:
+    print(f'  gap {(e-s)/60:.0f}min from {datetime.fromtimestamp(s, IST)} to {datetime.fromtimestamp(e, IST)}')
+"
+
+# If gaps exist, fill them — fetches MARK + LTP + OI for each gap range and merges
+python3 -c "
+import asyncio, os
+from dotenv import load_dotenv
+import pyarrow.parquet as pq
+from api_client import DeltaAPIClient
+from parquet_writer import merge_spot_data, append_or_create_spot
+from config import SPOT_PARQUET
+async def main():
+    load_dotenv()
+    key = os.getenv('ACCOUNT_1_KEY')
+    ts = pq.read_table(SPOT_PARQUET, columns=['timestamp_unix']).column('timestamp_unix').to_pylist()
+    gaps = [(ts[i-1]+60, ts[i]-60) for i in range(1, len(ts)) if ts[i] - ts[i-1] > 90]
+    print(f'Filling {len(gaps)} gaps')
+    async with DeltaAPIClient('lava', key) as client:
+        for i, (s, e) in enumerate(gaps, 1):
+            mark_c = await client.fetch_candles('MARK:BTCUSD', s, e)
+            ltp_c  = await client.fetch_candles('BTCUSD',      s, e)
+            oi_c   = await client.fetch_candles('OI:BTCUSD',   s, e)
+            print(f'  gap {i}/{len(gaps)}: mark={len(mark_c)} ltp={len(ltp_c)} oi={len(oi_c)}', flush=True)
+            if mark_c or ltp_c or oi_c:
+                append_or_create_spot(merge_spot_data(mark_c, ltp_c, oi_c), SPOT_PARQUET)
+asyncio.run(main())
+"
+```
+
+If spot was patched, you **must** also reset in-scope options to re-run union-building: reset 2026-MM in manifest and reset in-scope `empty` rows to `pending` (so newly-introduced strikes get probed). Otherwise the previously-built union (with holes) sticks.
+
 ### Per-expiry audit (run first to see scope)
 
 ```bash
